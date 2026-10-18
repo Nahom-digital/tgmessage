@@ -1,0 +1,17 @@
+[Unit]
+Description=watcher boot repair - fix NIC rename/clock before network services start
+Documentation=file:/root/tgmessage/README.md
+DefaultDependencies=no
+After=systemd-udevd.service local-fs.target
+Before=network-pre.target cloudflared.service tgmessage.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/tgmessage/watcher/watcher.sh boot-repair
+TimeoutStartSec=150
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

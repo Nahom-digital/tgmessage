@@ -1,0 +1,19 @@
+# secrets and local config - never commit these
+.env
+
+# runtime data: chat history, offsets, pids, logs, machine state
+state/
+files/
+watcher/state/
+watcher/logs/
+*.jsonl
+*.jsonl.bak
+*.pid
+
+# python junk
+__pycache__/
+*.py[cod]
+
+# local backups (may contain secrets and old code)
+.backup-*
+*pre-status-backup

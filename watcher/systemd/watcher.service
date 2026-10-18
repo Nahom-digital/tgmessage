@@ -1,0 +1,20 @@
+[Unit]
+Description=watcher - self-healing caretaker for the portable server disk
+Documentation=file:/root/tgmessage/README.md
+After=network.target
+After=watcher-boot.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/root/tgmessage/watcher/watcher.sh run
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watcher
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+# tgmessage systemd unit (template - install.sh fills in @TG_HOME@ and writes
+# the result to /etc/systemd/system/tgmessage.service).
+#
+# This is what makes tgmessage survive a reboot: the daemon starts on boot and
+# keeps long-polling Telegram, so nothing is missed while you are logged out.
+# `tgmessage` (the interactive UI) simply attaches to it.
+
+[Unit]
+Description=tgmessage - Telegram bot bridge (daemon for the Me>/Bot> terminal UI)
+Documentation=file:@TG_HOME@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@TG_HOME@
+Environment=TG_HOME=@TG_HOME@
+EnvironmentFile=-@TG_HOME@/.env
+ExecStart=/usr/bin/env python3 @TG_HOME@/tgmessage.py daemon
+Restart=always
+RestartSec=3
+# console output goes to the journal: journalctl -u tgmessage
+# the daemon also writes its own state/daemon.log
+
+# light hardening
+NoNewPrivileges=true
+# PrivateTmp is deliberately OFF: the daemon has to read the file you pass to
+# `tgmessage --FILE <path>` itself, and a private /tmp would hide files there.
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target
