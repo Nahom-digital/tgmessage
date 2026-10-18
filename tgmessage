@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# tgmessage - shell wrapper.
+#
+# This is the command you type from anywhere. It does nothing clever: it finds
+# its own folder, makes sure the config exists, and hands everything to
+# tgmessage.py. All the real work (talking to Telegram, the Me>/Bot> UI) lives
+# in the python file next to it.
+
+set -euo pipefail
+
+# Resolve this script's real folder, following the /usr/local/bin symlink.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  TARGET="$(readlink "$SELF")"
+  case "$TARGET" in
+    /*) SELF="$TARGET" ;;
+    *) SELF="$(dirname "$SELF")/$TARGET" ;;
+  esac
+done
+TG_HOME="$(cd "$(dirname "$SELF")" && pwd)"
+export TG_HOME
+
+PY="${TG_PYTHON:-python3}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "tgmessage: python3 not found" >&2
+  exit 1
+fi
+
+# First run: drop a default .env so the user can see what to fill in.
+if [ ! -f "$TG_HOME/.env" ]; then
+  mkdir -p "$TG_HOME/state"
+  cp "$TG_HOME/.env.example" "$TG_HOME/.env" 2>/dev/null || true
+fi
+
+exec "$PY" "$TG_HOME/tgmessage.py" "$@"
