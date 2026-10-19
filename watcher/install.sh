@@ -6,10 +6,8 @@
 #   * writes /etc/default/watcher if it does not exist yet
 #   * installs watcher.service + watcher-boot.service
 #   * links /usr/local/bin/watcher -> /root/tgmessage/watcher/watcher.sh
-#   * makes sure EVERY service this disk needs is enabled for boot:
-#       ssh, cloudflared, https-ssh, tgmessage,
-#       networking, postgresql, cron, gpm, systemd-timesyncd, wpa_supplicant,
-#       cloudflared-update.timer, https-ssh-restart.path, watcher
+#   * enables the watcher units (services you add with
+#     `tgmessage service add <name>` are enabled by the boot-repair pass)
 #   * runs one boot-repair pass
 #   * starts the watcher daemon
 #
@@ -31,7 +29,7 @@ if [ ! -f /etc/default/watcher ]; then
 WATCH_INTERVAL=30
 # 1 = send Telegram notifications, 0 = log only
 NOTIFY=1
-# where the tgmessage bot token + chat id live
+# where the tgmessage bot token + permissions live
 TG_HOME=/root/tgmessage
 # fallback address if DHCP fails - set these for YOUR network
 STATIC_IP=192.0.2.100/24
@@ -58,32 +56,11 @@ install -m 0644 "$DIR/systemd/watcher-boot.service" /etc/systemd/system/watcher-
 systemctl daemon-reload
 
 # ------------------------------------------------- enable everything -------- #
-UNITS=(
-    networking
-    ssh
-    cloudflared
-    https-ssh
-    tgmessage
-    postgresql
-    cron
-    gpm
-    systemd-timesyncd
-    wpa_supplicant
-    cloudflared-update.timer
-    https-ssh-restart.path
-)
-echo "enabling units for boot..."
-for u in "${UNITS[@]}"; do
-    if systemctl cat "$u" >/dev/null 2>&1; then
-        systemctl enable "$u" >/dev/null 2>&1 || echo "  ! could not enable $u"
-        printf "  enabled: %s\n" "$u"
-    else
-        echo "  (skip: $u not installed)"
-    fi
-done
+echo "enabling watcher units for boot..."
 systemctl enable watcher.service watcher-boot.service >/dev/null 2>&1
 echo "  enabled: watcher.service"
 echo "  enabled: watcher-boot.service"
+echo "  (add services to watch with: tgmessage service add <name>)"
 
 # --------------------------------------------------------------- start ------ #
 echo "running one boot-repair pass..."
@@ -96,6 +73,8 @@ systemctl --no-pager --lines=5 status watcher.service || true
 
 echo
 echo "watcher installed."
-echo "  watcher check      - status now"
-echo "  watcher log        - follow log"
-echo "  watcher prep       - pre-download NIC firmware for the old PC (do this while online)"
+echo "  tgmessage service add <name>  - watch a systemd service (down -> restart)"
+echo "  tgmessage allow mang <id>     - send watcher reports to your Telegram chat"
+echo "  watcher check                 - status now"
+echo "  watcher log                   - follow log"
+echo "  watcher prep                  - pre-download NIC firmware for the old PC (do this while online)"
