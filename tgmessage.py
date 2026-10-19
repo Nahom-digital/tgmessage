@@ -19,9 +19,16 @@ One folder, two faces:
 Multi-chat model
 ----------------
 A bot can be messaged by many people, but it may only talk to people who are
-allowed. Allowed chat ids live in .env (TG_ALLOWED_CHAT_IDS). Anything from an
-unknown private chat is held as a *request* (state/pending.json) until you
-allow it:
+allowed. Permission levels are managed in .env by the CLI:
+
+    tgmessage allow <id>         chat only (send/receive/files)
+    tgmessage allow sys <id>     + /status and /logs from Telegram
+    tgmessage allow mang <id>    + watcher reports (manage)
+    tgmessage deny [sys|mang] <id>
+    tgmessage service add <unit> watch a systemd service (restart + alert)
+
+Anything from an unknown private chat is held as a *request*
+(state/pending.json) until you allow it:
 
     tgmessage --request          list who is asking to talk
     tgmessage --allow 12345      allow that chat (saved to .env)
@@ -209,7 +216,10 @@ def osc52(text):
 
 ENV_TEMPLATE = [
     ("TG_BOT_TOKEN", "", "BotFather token, looks like 123456789:AA........"),
-    ("TG_ALLOWED_CHAT_IDS", "", "comma-separated chat ids allowed to use this bot"),
+    ("TG_ALLOWED_CHAT_IDS", "", "chat ids allowed to talk to this bot"),
+    ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status and /logs (tgmessage allow sys)"),
+    ("TG_MANG_CHAT_IDS", "", "chat ids that receive watcher reports (tgmessage allow mang)"),
+    ("TG_WATCH_SERVICES", "", "systemd services watched by the watcher (tgmessage service add)"),
     ("TG_DEFAULT_CHAT", "", "chat id used by one-shot sends and on startup"),
     ("TG_HOST", "127.0.0.1", "daemon bind address"),
     ("TG_PORT", "8765", "daemon port"),
@@ -217,6 +227,33 @@ ENV_TEMPLATE = [
     ("TG_POLL_TIMEOUT", "30", "getUpdates long-poll seconds"),
     ("TG_WATCHER_LOG", "", "watcher log shown by /logs (default: <home>/watcher/logs/watcher.log)"),
 ]
+
+UNIT_SUFFIXES = (
+    ".service", ".timer", ".path", ".socket", ".target", ".mount",
+    ".automount", ".swap", ".slice", ".scope", ".device",
+)
+
+
+def normalize_unit(name):
+    """'nginx' -> 'nginx.service'; units with a known suffix are kept."""
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    if not name.endswith(UNIT_SUFFIXES):
+        name += ".service"
+    if not re.fullmatch(r"[A-Za-z0-9@_.:\\-]+", name):
+        return ""
+    return name
+
+
+def parse_units(raw):
+    """Parse TG_WATCH_SERVICES into a stable, de-duplicated unit list."""
+    out = []
+    for chunk in str(raw or "").replace(",", " ").split():
+        unit = normalize_unit(chunk)
+        if unit and unit not in out:
+            out.append(unit)
+    return out
 
 
 def env_file(home):
@@ -285,6 +322,13 @@ class Config:
 
         self.token = get("TG_BOT_TOKEN").strip()
         self.allowed = parse_ids(get("TG_ALLOWED_CHAT_IDS"))
+        self.sys = parse_ids(get("TG_SYS_CHAT_IDS"))
+        self.mang = parse_ids(get("TG_MANG_CHAT_IDS"))
+        # Higher levels imply lower ones: mang -> sys -> chat.
+        self.mang = list(dict.fromkeys(self.mang))
+        self.sys = list(dict.fromkeys(self.sys + self.mang))
+        self.allowed = list(dict.fromkeys(self.allowed + self.sys))
+        self.watch_services = parse_units(get("TG_WATCH_SERVICES"))
         legacy = get("TG_CHAT_ID").strip()
         if legacy and legacy not in self.allowed:
             self.allowed.append(legacy)
@@ -319,9 +363,16 @@ class Config:
         return os.path.join(self.state_dir, "daemon.pid")
 
 
-def persist_allowed(cfg, allowed, default_chat):
-    """Write the allowed list / default chat back into .env."""
-    updates = {"TG_ALLOWED_CHAT_IDS": ",".join(sorted(allowed, key=id_sort_key))}
+def persist_permissions(cfg, allowed, sys_ids, mang_ids, default_chat):
+    """Write the permission lists / default chat back into .env."""
+    mang_ids = set(mang_ids)
+    sys_ids = set(sys_ids) | mang_ids
+    allowed = set(allowed) | sys_ids
+    updates = {
+        "TG_ALLOWED_CHAT_IDS": ",".join(sorted(allowed, key=id_sort_key)),
+        "TG_SYS_CHAT_IDS": ",".join(sorted(sys_ids, key=id_sort_key)),
+        "TG_MANG_CHAT_IDS": ",".join(sorted(mang_ids, key=id_sort_key)),
+    }
     if default_chat:
         updates["TG_DEFAULT_CHAT"] = default_chat
     write_env(cfg.home, updates)
@@ -750,19 +801,6 @@ def message_text(msg):
 # live system status for the /status chat command
 # --------------------------------------------------------------------------
 
-# services a healthy server must have running
-STATUS_UNITS = [
-    "watcher.service",
-    "ssh",
-    "networking",
-    "cloudflared",
-    "https-ssh",
-    "tgmessage",
-    "postgresql",
-    "cron",
-]
-
-
 def _read_int(path):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1037,27 +1075,30 @@ def status_public_ip(timeout=7):
     return None
 
 
-def status_services():
-    """[(label, state)] for every service the server needs."""
+def status_services(units):
+    """[(label, state)] for the services added with `tgmessage service add`."""
+    units = list(units or [])
+    if not units:
+        return []
     if not has_systemd():
-        return [("systemd", "unavailable")]
+        return [(u, "unavailable") for u in units]
     try:
         res = subprocess.run(
-            ["systemctl", "is-active", *STATUS_UNITS], capture_output=True, text=True, timeout=15
+            ["systemctl", "is-active", *units], capture_output=True, text=True, timeout=15
         )
         lines = [l.strip() for l in res.stdout.splitlines()]
     except Exception:  # noqa: BLE001
         lines = []
-    while len(lines) < len(STATUS_UNITS):
+    while len(lines) < len(units):
         lines.append("?")
     out = []
-    for unit, state in zip(STATUS_UNITS, lines):
+    for unit, state in zip(units, lines):
         label = unit[: -len(".service")] if unit.endswith(".service") else unit
         out.append((label, state))
     return out
 
 
-def system_status_text():
+def system_status_text(cfg):
     """The text the Telegram /status command replies with."""
     lines = [f"\U0001F4CA status - {socket.gethostname()}"]
     line = f"uptime: {status_uptime()}"
@@ -1068,13 +1109,16 @@ def system_status_text():
         pass
     lines.append(line)
 
-    services = status_services()
-    up = sum(1 for _l, s in services if s == "active")
+    services = status_services(cfg.watch_services)
     lines.append("")
-    lines.append(f"services: {up}/{len(services)} up")
-    for label, state in services:
-        mark = "OK" if state == "active" else state.upper()
-        lines.append(f"  {label}: {mark}")
+    if not services:
+        lines.append("services: none configured (tgmessage service add <name>)")
+    else:
+        up = sum(1 for _l, s in services if s == "active")
+        lines.append(f"services: {up}/{len(services)} up")
+        for label, state in services:
+            mark = "OK" if state == "active" else state.upper()
+            lines.append(f"  {label}: {mark}")
 
     cpu = status_cpu_percent()
     temp = status_cpu_temp()
@@ -1231,23 +1275,34 @@ def incoming_media(msg):
     return None
 
 
-def chat_help_text(cfg):
-    return (
-        "tgmessage commands (from the Telegram chat):\n"
-        "\n"
-        "/status - live server report: all services, CPU load + temperature,\n"
-        "          fan speed, RAM, disk, battery, private + public IP\n"
-        "/logs   - last 40 lines of the watcher system log (/logs 100 for more)\n"
-        "/help   - show this help\n"
-        "\n"
-        f"Send a photo or any file (.sh, .txt, .zip, ...) and it is saved to:\n"
-        f"  {cfg.files_dir}\n"
-        "You get a confirmation with the saved path. Files up to 20 MB\n"
-        "can be downloaded (Telegram Bot API limit).\n"
-        "\n"
-        "The terminal UI additionally has /session, /allow, /deny,\n"
-        "/requests, /copy and /file <path>."
-    )
+def chat_help_text(cfg, is_sys=False):
+    lines = [
+        "tgmessage commands (from the Telegram chat):",
+        "",
+        "/help   - show this help",
+    ]
+    if is_sys:
+        lines += [
+            "/status - live server report: configured services, CPU load + temperature,",
+            "          fan speed, RAM, disk, battery, private + public IP",
+            "/logs   - last 40 lines of the watcher system log (/logs 100 for more)",
+        ]
+    else:
+        lines += [
+            "/status and /logs need sys access - ask the bot owner to run:",
+            "  tgmessage allow sys <your-chat-id>",
+        ]
+    lines += [
+        "",
+        "Send a photo or any file (.sh, .txt, .zip, ...) and it is saved to:",
+        f"  {cfg.files_dir}",
+        "You get a confirmation with the saved path. Files up to 20 MB",
+        "can be downloaded (Telegram Bot API limit).",
+        "",
+        "The terminal UI additionally has /session, /allow, /deny,",
+        "/requests, /copy and /file <path>.",
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -1265,6 +1320,8 @@ class Daemon:
         self.offset_path = os.path.join(cfg.state_dir, "offset.json")
         self.offset = self._load_offset()
         self.allowed = set(cfg.allowed)
+        self.sys = set(cfg.sys)
+        self.mang = set(cfg.mang)
         self.default_chat = cfg.default_chat
         self.bot = None
         self.clients = set()
@@ -1292,43 +1349,79 @@ class Daemon:
     def reload_config(self):
         disk = read_env(self.cfg.home)
         allowed = set(parse_ids(disk.get("TG_ALLOWED_CHAT_IDS")))
+        mang = set(parse_ids(disk.get("TG_MANG_CHAT_IDS")))
+        sys_ids = set(parse_ids(disk.get("TG_SYS_CHAT_IDS"))) | mang
+        allowed |= sys_ids
         legacy = (disk.get("TG_CHAT_ID") or "").strip()
         if legacy:
             allowed.add(legacy)
         self.allowed = allowed
+        self.sys = sys_ids
+        self.mang = mang
         default = (disk.get("TG_DEFAULT_CHAT") or "").strip() or legacy
         if default and default not in allowed:
             default = ""
         if not default and allowed:
             default = sorted(allowed, key=id_sort_key)[0]
         self.default_chat = default
+        self.cfg.watch_services = parse_units(disk.get("TG_WATCH_SERVICES"))
 
     def _persist(self):
-        persist_allowed(self.cfg, self.allowed, self.default_chat)
+        persist_permissions(self.cfg, self.allowed, self.sys, self.mang, self.default_chat)
 
-    def do_allow(self, cid):
+    def can_sys(self, cid):
+        return str(cid) in self.sys
+
+    def can_mang(self, cid):
+        return str(cid) in self.mang
+
+    def do_allow(self, cid, level="chat"):
         cid = str(cid)
-        if cid in self.allowed:
-            return False
-        self.allowed.add(cid)
+        if level == "sys":
+            if cid in self.sys:
+                return False
+            self.sys.add(cid)
+            self.allowed.add(cid)
+        elif level == "mang":
+            if cid in self.mang:
+                return False
+            self.mang.add(cid)
+            self.sys.add(cid)
+            self.allowed.add(cid)
+        else:
+            if cid in self.allowed:
+                return False
+            self.allowed.add(cid)
         if not self.default_chat:
             self.default_chat = cid
         self.pending.remove(cid)
         self._persist()
-        log(self.cfg, f"allowed chat {cid}")
+        log(self.cfg, f"allowed {level} for chat {cid}")
         self._announce()
         threading.Thread(target=self._refresh_then_announce, args=(cid,), daemon=True).start()
         return True
 
-    def do_deny(self, cid):
+    def do_deny(self, cid, level="chat"):
         cid = str(cid)
-        if cid not in self.allowed:
-            return False
-        self.allowed.discard(cid)
-        if self.default_chat == cid:
+        if level == "mang":
+            if cid not in self.mang:
+                return False
+            self.mang.discard(cid)
+        elif level == "sys":
+            if cid not in self.sys:
+                return False
+            self.sys.discard(cid)
+            self.mang.discard(cid)
+        else:
+            if cid not in self.allowed:
+                return False
+            self.allowed.discard(cid)
+            self.sys.discard(cid)
+            self.mang.discard(cid)
+        if self.default_chat == cid and cid not in self.allowed:
             self.default_chat = sorted(self.allowed, key=id_sort_key)[0] if self.allowed else ""
         self._persist()
-        log(self.cfg, f"denied chat {cid}")
+        log(self.cfg, f"denied {level} for chat {cid}")
         self._announce()
         return True
 
@@ -1337,6 +1430,8 @@ class Daemon:
             {
                 "type": "allowed",
                 "allowed": sorted(self.allowed, key=id_sort_key),
+                "sys": sorted(self.sys, key=id_sort_key),
+                "mang": sorted(self.mang, key=id_sort_key),
                 "default_chat": self.default_chat,
             }
         )
@@ -1392,6 +1487,8 @@ class Daemon:
                     "username": meta.get("username") or "",
                     "type": meta.get("type") or "",
                     "allowed": allowed,
+                    "sys": cid in self.sys,
+                    "mang": cid in self.mang,
                     "pending": cid in pend,
                     "last_ts": meta.get("last_ts") or 0,
                     "count": self.history.count(cid) if allowed else 0,
@@ -1406,6 +1503,8 @@ class Daemon:
             "bot": self.bot,
             "port": self.cfg.port,
             "allowed": sorted(self.allowed, key=id_sort_key),
+            "sys": sorted(self.sys, key=id_sort_key),
+            "mang": sorted(self.mang, key=id_sort_key),
             "default_chat": self.default_chat,
             "pendings": self.pending.all(),
             "sessions": self.sessions_payload(),
@@ -1499,8 +1598,14 @@ class Daemon:
         if "@" in head:  # /status@thebot in group chats
             head = head.split("@", 1)[0]
         if head == "/status":
-            threading.Thread(target=self._chat_status_reply, args=(cid,), daemon=True).start()
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/status", "sys"), daemon=True).start()
+            else:
+                threading.Thread(target=self._chat_status_reply, args=(cid,), daemon=True).start()
         elif head == "/logs":
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/logs", "sys"), daemon=True).start()
+                return
             n = 40
             parts = cmd.split()
             if len(parts) > 1:
@@ -1531,10 +1636,18 @@ class Daemon:
         self.registry.touch(cid, {}, "out")
         self.broadcast({"type": "msg", **rec})
 
+    def _chat_denied_reply(self, cid, command, level):
+        log(self.cfg, f"{command} denied for chat {cid} (needs {level} access)")
+        self._record_out(
+            cid,
+            f"permission denied: {command} needs {level} access.\n"
+            f"Ask the bot owner to run: tgmessage allow {level} {cid}",
+        )
+
     def _chat_status_reply(self, cid):
         log(self.cfg, f"/status requested by chat {cid}")
         try:
-            text = system_status_text()
+            text = system_status_text(self.cfg)
         except Exception as exc:  # noqa: BLE001
             log(self.cfg, f"/status failed: {exc!r}")
             text = f"status error: {exc!r}"
@@ -1551,7 +1664,7 @@ class Daemon:
 
     def _chat_help_reply(self, cid):
         log(self.cfg, f"/help requested by chat {cid}")
-        self._record_out(cid, chat_help_text(self.cfg))
+        self._record_out(cid, chat_help_text(self.cfg, is_sys=self.can_sys(cid)))
 
     # ---- incoming files: saved into <home>/files ----------------------
     def maybe_save_media(self, cid, msg):
@@ -1671,16 +1784,22 @@ class Daemon:
             if not cid:
                 self.send(conn, {"type": "ack", "ok": False, "error": "no chat id given"})
                 return
-            self.do_allow(cid)
-            self.send(conn, {"type": "ack", "ok": True, "chat_id": cid})
+            level = str(cmd.get("level") or "chat").lower()
+            if level not in ("chat", "sys", "mang"):
+                level = "chat"
+            self.do_allow(cid, level)
+            self.send(conn, {"type": "ack", "ok": True, "chat_id": cid, "level": level})
             return
         if name == "deny":
             cid = str(cmd.get("chat_id") or "").strip()
             if not cid:
                 self.send(conn, {"type": "ack", "ok": False, "error": "no chat id given"})
                 return
-            self.do_deny(cid)
-            self.send(conn, {"type": "ack", "ok": True, "chat_id": cid})
+            level = str(cmd.get("level") or "chat").lower()
+            if level not in ("chat", "sys", "mang"):
+                level = "chat"
+            self.do_deny(cid, level)
+            self.send(conn, {"type": "ack", "ok": True, "chat_id": cid, "level": level})
             return
         if name == "history":
             cid = str(cmd.get("chat_id") or self.default_chat or "")
@@ -2314,8 +2433,13 @@ class ChatClient:
             label = f"@{sess['username']}" if sess.get("username") else (sess.get("name") or cid)
             real = sess.get("name") or ""
             extra = f"  {c['dim']}{real}{c['rst']}" if real and real != label.lstrip("@") else ""
+            tags = ""
+            if sess.get("mang"):
+                tags = f"  {c['yellow']}[mang]{c['rst']}"
+            elif sess.get("sys"):
+                tags = f"  {c['yellow']}[sys]{c['rst']}"
             lines.append(
-                f" {mark} {i:>2}. {label}{extra}  {c['dim']}{sess.get('count', 0)} msgs{c['rst']}"
+                f" {mark} {i:>2}. {label}{extra}{tags}  {c['dim']}{sess.get('count', 0)} msgs{c['rst']}"
             )
         pending = [s for s in others if s.get("pending")] or [
             {"chat_id": p.get("chat_id"), "name": p.get("name"), "username": p.get("username")}
@@ -2409,11 +2533,17 @@ class ChatClient:
             self.expect = "requests"
             self.send_json({"cmd": "requests"})
             return True
-        if head in ("/allow", "/deny") and len(parts) == 2:
-            verb = "allow" if head == "/allow" else "deny"
-            self.send_json({"cmd": verb, "chat_id": parts[1]})
-            self.editor.print_note(f"* {verb} {parts[1]}", self.c["yellow"])
-            return True
+        if head in ("/allow", "/deny"):
+            args = parts[1:]
+            level = "chat"
+            if args and args[0].lower() in ("sys", "mang", "manage"):
+                level = "mang" if args[0].lower() in ("mang", "manage") else "sys"
+                args = args[1:]
+            if len(args) == 1:
+                verb = "allow" if head == "/allow" else "deny"
+                self.send_json({"cmd": verb, "chat_id": args[0], "level": level})
+                self.editor.print_note(f"* {verb} {level} {args[0]}", self.c["yellow"])
+                return True
         if (
             head == "/copy"
             and len(parts) <= 2
@@ -2716,11 +2846,18 @@ tgmessage - Telegram from any terminal, one session per chat.
   tgmessage --to <id> --FILE <path> --caption "hi"
   tgmessage file <path>          same as --FILE
 
-  tgmessage sessions             list chats and their history size
+  tgmessage sessions             list chats, permissions and history size
   tgmessage requests, --request  list chats waiting to be allowed
-  tgmessage allow <id> [...]     allow chat id(s), saved to .env
-  tgmessage deny <id> [...]      revoke chat id(s)
-  tgmessage --allow <id>         same as `allow <id>`
+
+  tgmessage allow <id> [...]     allow a chat to talk to the bot
+  tgmessage allow sys <id> ...   + /status and /logs from Telegram
+  tgmessage allow mang <id> ...  + watcher reports (manage)
+  tgmessage deny <id> [...]      revoke everything for a chat
+  tgmessage deny sys|mang <id>   revoke only that level
+
+  tgmessage service add <unit> [...]      watch a systemd service
+  tgmessage service remove <unit> [...]   stop watching it
+  tgmessage service list                  show watched services
 
   tgmessage log [n] [--chat id]  recent messages (all chats unless --chat)
   tgmessage status               daemon + token + sessions health check
@@ -2733,13 +2870,14 @@ tgmessage - Telegram from any terminal, one session per chat.
   tgmessage uninstall            remove service + link
   tgmessage version | help
 
-In the UI: /session [n|id] pick a chat, /allow <id>, /deny <id>,
+In the UI: /session [n|id] pick a chat, /allow [sys|mang] <id>, /deny <id>,
 /requests, /copy [n|all], /file <path> [caption], //text for a literal slash.
 
-From the Telegram chat: /status replies with a live server report
-(all services, CPU + temp, fan speed, RAM, disk, battery, private + public IP),
+From the Telegram chat (sys access needed for the first two):
+/status replies with a live server report (the services you added with
+`tgmessage service add`, CPU + temp, fan speed, RAM, disk, battery, IPs);
 /logs replies with the tail of the watcher system log
-(/root/tgmessage/watcher/logs/watcher.log; /logs 100 for more lines),
+(/root/tgmessage/watcher/logs/watcher.log; /logs 100 for more lines);
 /help lists these commands, and every photo/file you send is saved
 into the files/ folder (see TG_FILES_DIR in .env).
 """
@@ -2816,6 +2954,9 @@ def cmd_token(cfg, colours, rest):
     print(f"{env_file(cfg.home)}")
     print(f"  TG_BOT_TOKEN=***{shown[-6:]}")
     print(f"  TG_ALLOWED_CHAT_IDS={','.join(cfg.allowed) or '(none)'}")
+    print(f"  TG_SYS_CHAT_IDS={','.join(cfg.sys) or '(none)'}")
+    print(f"  TG_MANG_CHAT_IDS={','.join(cfg.mang) or '(none)'}")
+    print(f"  TG_WATCH_SERVICES={','.join(cfg.watch_services) or '(none)'}")
     print(f"  TG_DEFAULT_CHAT={cfg.default_chat or '(none)'}")
     print(f"  TG_HOST={cfg.host}")
     print(f"  TG_PORT={cfg.port}")
@@ -2887,22 +3028,40 @@ def cmd_requests(cfg, colours, rest):
     return 0
 
 
-def _apply_allow(cfg, colours, ids, allow=True):
+def _apply_allow(cfg, colours, ids, allow=True, level="chat"):
     ids = [str(i).strip() for i in ids if str(i).strip()]
     bad = [i for i in ids if not looks_like_id(i)]
     if bad:
         print(f"! not a chat id: {', '.join(bad)}", file=sys.stderr)
         return 2
     allowed = set(cfg.allowed)
+    sys_ids = set(cfg.sys)
+    mang_ids = set(cfg.mang)
     if allow:
-        allowed |= set(ids)
+        if level == "sys":
+            sys_ids |= set(ids)
+            allowed |= set(ids)
+        elif level == "mang":
+            mang_ids |= set(ids)
+            sys_ids |= set(ids)
+            allowed |= set(ids)
+        else:
+            allowed |= set(ids)
         default = cfg.default_chat or ids[0]
     else:
-        allowed -= set(ids)
+        if level == "mang":
+            mang_ids -= set(ids)
+        elif level == "sys":
+            sys_ids -= set(ids)
+            mang_ids -= set(ids)
+        else:
+            allowed -= set(ids)
+            sys_ids -= set(ids)
+            mang_ids -= set(ids)
         default = cfg.default_chat
-        if default in ids:
+        if default in ids and default not in allowed:
             default = sorted(allowed, key=id_sort_key)[0] if allowed else ""
-    persist_allowed(cfg, allowed, default)
+    persist_permissions(cfg, allowed, sys_ids, mang_ids, default)
 
     pend = Pending(os.path.join(cfg.state_dir, "pending.json"))
     for cid in ids:
@@ -2910,8 +3069,11 @@ def _apply_allow(cfg, colours, ids, allow=True):
             pend.remove(cid)
 
     verb = "allowed" if allow else "denied"
-    print(f"{verb}: {', '.join(ids)}")
+    suffix = f" ({level})" if level != "chat" else ""
+    print(f"{verb}{suffix}: {', '.join(ids)}")
     print(f"  TG_ALLOWED_CHAT_IDS={','.join(sorted(allowed, key=id_sort_key)) or '(none)'}")
+    print(f"  TG_SYS_CHAT_IDS={','.join(sorted(sys_ids, key=id_sort_key)) or '(none)'}")
+    print(f"  TG_MANG_CHAT_IDS={','.join(sorted(mang_ids, key=id_sort_key)) or '(none)'}")
     print(f"  TG_DEFAULT_CHAT={default or '(none)'}")
     if notify_daemon(cfg, {"cmd": "reload"}):
         print(f"{colours['dim']}daemon reloaded{colours['rst']}")
@@ -2920,18 +3082,102 @@ def _apply_allow(cfg, colours, ids, allow=True):
     return 0
 
 
+def _parse_level(rest):
+    """Split '<sys|mang> <id> ...' into (level, ids)."""
+    level = "chat"
+    args = list(rest)
+    if args and args[0].lower() in ("sys", "system"):
+        level = "sys"
+        args = args[1:]
+    elif args and args[0].lower() in ("mang", "manage"):
+        level = "mang"
+        args = args[1:]
+    return level, args
+
+
 def cmd_allow(cfg, colours, rest):
-    if not rest:
-        print("usage: tgmessage allow <chatid> [...]", file=sys.stderr)
+    level, ids = _parse_level(rest)
+    if not ids:
+        print("usage: tgmessage allow [sys|mang] <chatid> [...]", file=sys.stderr)
         return 2
-    return _apply_allow(cfg, colours, rest, allow=True)
+    return _apply_allow(cfg, colours, ids, allow=True, level=level)
 
 
 def cmd_deny(cfg, colours, rest):
-    if not rest:
-        print("usage: tgmessage deny <chatid> [...]", file=sys.stderr)
+    level, ids = _parse_level(rest)
+    if not ids:
+        print("usage: tgmessage deny [sys|mang] <chatid> [...]", file=sys.stderr)
         return 2
-    return _apply_allow(cfg, colours, rest, allow=False)
+    return _apply_allow(cfg, colours, ids, allow=False, level=level)
+
+
+def _service_list(cfg):
+    return list(cfg.watch_services)
+
+
+def cmd_service(cfg, colours, rest):
+    c = colours
+    action = (rest[0].lower() if rest else "list")
+    args = rest[1:] if rest else []
+
+    if action in ("list", "ls", "show", "status"):
+        units = _service_list(cfg)
+        if not units:
+            print("no watched services - add one with: tgmessage service add <name>")
+            return 0
+        print(f"{c['b']}watched services{c['rst']}  (saved in .env, TG_WATCH_SERVICES)")
+        states = dict(status_services(units)) if has_systemd() else {}
+        for unit in units:
+            label = unit[: -len(".service")] if unit.endswith(".service") else unit
+            state = states.get(label)
+            mark = f"{c['green']}{state}{c['rst']}" if state == "active" else (
+                f"{c['red']}{state or 'unknown'}{c['rst']}"
+            )
+            print(f"  {label}  ({mark})")
+        return 0
+
+    if action in ("add", "watch") or action in ("remove", "rm", "del", "unwatch"):
+        want = action in ("add", "watch")
+        if not args:
+            print(f"usage: tgmessage service {action} <systemd-unit> [...]", file=sys.stderr)
+            return 2
+        current = set(_service_list(cfg))
+        units = []
+        for raw in args:
+            for part in str(raw).replace(",", " ").split():
+                unit = normalize_unit(part)
+                if not unit:
+                    print(f"! not a valid unit name: {part}", file=sys.stderr)
+                    return 2
+                units.append(unit)
+        if want:
+            current |= set(units)
+        else:
+            current -= set(units)
+        write_env(cfg.home, {"TG_WATCH_SERVICES": ",".join(sorted(current))})
+        cfg.watch_services = sorted(current)
+        verb = "watching" if want else "no longer watching"
+        print(f"{verb}: {', '.join(units)}")
+        print(f"  TG_WATCH_SERVICES={','.join(sorted(current)) or '(none)'}")
+        missing = []
+        if want and has_systemd():
+            for unit in units:
+                r = subprocess.run(["systemctl", "cat", unit], capture_output=True, text=True)
+                if r.returncode != 0:
+                    missing.append(unit)
+        if missing:
+            print(
+                f"{c['yellow']}! not installed right now: {', '.join(missing)}"
+                f" - the watcher will report it as failed{c['rst']}"
+            )
+        if notify_daemon(cfg, {"cmd": "reload"}):
+            print(f"{c['dim']}daemon reloaded (no watcher restart needed - it re-reads .env every cycle){c['rst']}")
+        else:
+            print(f"{c['dim']}the watcher re-reads .env every cycle - no restart needed{c['rst']}")
+        return 0
+
+    print("usage: tgmessage service <add|remove|list> [unit ...]", file=sys.stderr)
+    return 2
 
 
 def cmd_status(cfg, colours, rest):
@@ -2940,6 +3186,9 @@ def cmd_status(cfg, colours, rest):
     print(f"  .env          {env_file(cfg.home)} {'(ok)' if os.path.exists(env_file(cfg.home)) else '(MISSING)'}")
     print(f"  token         {'***' + cfg.token[-6:] if cfg.token else '(none)'}")
     print(f"  allowed       {', '.join(sorted(cfg.allowed, key=id_sort_key)) or '(none)'}")
+    print(f"  sys           {', '.join(sorted(cfg.sys, key=id_sort_key)) or '(none)'}")
+    print(f"  mang          {', '.join(sorted(cfg.mang, key=id_sort_key)) or '(none)'}")
+    print(f"  services      {', '.join(cfg.watch_services) or '(none - tgmessage service add)'}")
     print(f"  default chat  {cfg.default_chat or '(none)'}")
     print(f"  listening     {cfg.host}:{cfg.port}")
 
@@ -3058,6 +3307,8 @@ COMMANDS = {
     "request": cmd_requests,
     "allow": cmd_allow,
     "deny": cmd_deny,
+    "service": cmd_service,
+    "services": lambda cfg, colours, rest: cmd_service(cfg, colours, ["list"]),
     "status": cmd_status,
     "log": cmd_log,
     "up": cmd_up,
@@ -3125,9 +3376,17 @@ def main(argv):
         cfg.log_chat = str(opts.chat)
 
     if opts.allow:
-        return cmd_allow(cfg, colours, opts.allow)
+        vals = list(opts.allow)
+        extra = opts.rest + unknown
+        if vals and vals[0].lower() in ("sys", "system", "mang", "manage") and all(looks_like_id(x) for x in extra):
+            vals += extra
+        return cmd_allow(cfg, colours, vals)
     if opts.deny:
-        return cmd_deny(cfg, colours, opts.deny)
+        vals = list(opts.deny)
+        extra = opts.rest + unknown
+        if vals and vals[0].lower() in ("sys", "system", "mang", "manage") and all(looks_like_id(x) for x in extra):
+            vals += extra
+        return cmd_deny(cfg, colours, vals)
     if opts.request:
         return cmd_requests(cfg, colours, [])
 

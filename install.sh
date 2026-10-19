@@ -170,8 +170,11 @@ cat <<EOF
   tgmessage --token '<new token>'   save/replace the token and restart
   tgmessage                         open the Me>/Bot> chat UI
   tgmessage "hello"                 send one message
+  tgmessage allow sys <id>          let a chat use /status + /logs
+  tgmessage allow mang <id>         send watcher reports to a chat
+  tgmessage service add <name>      watch a systemd service
   tgmessage status                  health check of the bot bridge
-  watcher check                     machine health report (network, clock, services)
+  watcher check                     machine health report (network, clock, disk)
   watcher log                       follow the watcher log (or send /logs to the bot)
 EOF
 echo
