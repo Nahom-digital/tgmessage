@@ -220,6 +220,7 @@ ENV_TEMPLATE = [
     ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status and /logs (tgmessage allow sys)"),
     ("TG_MANG_CHAT_IDS", "", "chat ids that receive watcher reports (tgmessage allow mang)"),
     ("TG_WATCH_SERVICES", "", "systemd services watched by the watcher (tgmessage service add)"),
+    ("TG_SERVICE_NO_RESTART", "", "watched services the watcher reports but never restarts (tgmessage service <unit> stop)"),
     ("TG_DEFAULT_CHAT", "", "chat id used by one-shot sends and on startup"),
     ("TG_HOST", "127.0.0.1", "daemon bind address"),
     ("TG_PORT", "8765", "daemon port"),
@@ -329,6 +330,7 @@ class Config:
         self.sys = list(dict.fromkeys(self.sys + self.mang))
         self.allowed = list(dict.fromkeys(self.allowed + self.sys))
         self.watch_services = parse_units(get("TG_WATCH_SERVICES"))
+        self.service_no_restart = parse_units(get("TG_SERVICE_NO_RESTART"))
         legacy = get("TG_CHAT_ID").strip()
         if legacy and legacy not in self.allowed:
             self.allowed.append(legacy)
@@ -2856,7 +2858,9 @@ tgmessage - Telegram from any terminal, one session per chat.
   tgmessage deny sys|mang <id>   revoke only that level
 
   tgmessage service add <unit> [...]      watch a systemd service
-  tgmessage service remove <unit> [...]   stop watching it
+  tgmessage service remove|rem <unit> [...]  stop watching it
+  tgmessage service <unit> stop           report only - never auto-restart it
+  tgmessage service <unit> restart        back to auto-restart (default)
   tgmessage service list                  show watched services
 
   tgmessage log [n] [--chat id]  recent messages (all chats unless --chat)
@@ -2957,6 +2961,7 @@ def cmd_token(cfg, colours, rest):
     print(f"  TG_SYS_CHAT_IDS={','.join(cfg.sys) or '(none)'}")
     print(f"  TG_MANG_CHAT_IDS={','.join(cfg.mang) or '(none)'}")
     print(f"  TG_WATCH_SERVICES={','.join(cfg.watch_services) or '(none)'}")
+    print(f"  TG_SERVICE_NO_RESTART={','.join(cfg.service_no_restart) or '(none)'}")
     print(f"  TG_DEFAULT_CHAT={cfg.default_chat or '(none)'}")
     print(f"  TG_HOST={cfg.host}")
     print(f"  TG_PORT={cfg.port}")
@@ -3125,6 +3130,7 @@ def cmd_service(cfg, colours, rest):
         if not units:
             print("no watched services - add one with: tgmessage service add <name>")
             return 0
+        notify_only = set(cfg.service_no_restart)
         print(f"{c['b']}watched services{c['rst']}  (saved in .env, TG_WATCH_SERVICES)")
         states = dict(status_services(units)) if has_systemd() else {}
         for unit in units:
@@ -3133,15 +3139,17 @@ def cmd_service(cfg, colours, rest):
             mark = f"{c['green']}{state}{c['rst']}" if state == "active" else (
                 f"{c['red']}{state or 'unknown'}{c['rst']}"
             )
-            print(f"  {label}  ({mark})")
+            tag = f"  {c['yellow']}[notify-only - no auto-restart]{c['rst']}" if unit in notify_only else ""
+            print(f"  {label}  ({mark}){tag}")
         return 0
 
-    if action in ("add", "watch") or action in ("remove", "rm", "del", "unwatch"):
+    if action in ("add", "watch") or action in ("remove", "rm", "rem", "del", "unwatch"):
         want = action in ("add", "watch")
         if not args:
             print(f"usage: tgmessage service {action} <systemd-unit> [...]", file=sys.stderr)
             return 2
         current = set(_service_list(cfg))
+        notify_only = set(cfg.service_no_restart)
         units = []
         for raw in args:
             for part in str(raw).replace(",", " ").split():
@@ -3152,10 +3160,16 @@ def cmd_service(cfg, colours, rest):
                 units.append(unit)
         if want:
             current |= set(units)
+            notify_only -= set(units)      # re-adding goes back to auto-restart
         else:
             current -= set(units)
-        write_env(cfg.home, {"TG_WATCH_SERVICES": ",".join(sorted(current))})
+            notify_only -= set(units)      # no dangling notify-only entry
+        write_env(cfg.home, {
+            "TG_WATCH_SERVICES": ",".join(sorted(current)),
+            "TG_SERVICE_NO_RESTART": ",".join(sorted(notify_only)),
+        })
         cfg.watch_services = sorted(current)
+        cfg.service_no_restart = sorted(notify_only)
         verb = "watching" if want else "no longer watching"
         print(f"{verb}: {', '.join(units)}")
         print(f"  TG_WATCH_SERVICES={','.join(sorted(current)) or '(none)'}")
@@ -3170,14 +3184,47 @@ def cmd_service(cfg, colours, rest):
                 f"{c['yellow']}! not installed right now: {', '.join(missing)}"
                 f" - the watcher will report it as failed{c['rst']}"
             )
-        if notify_daemon(cfg, {"cmd": "reload"}):
-            print(f"{c['dim']}daemon reloaded (no watcher restart needed - it re-reads .env every cycle){c['rst']}")
-        else:
-            print(f"{c['dim']}the watcher re-reads .env every cycle - no restart needed{c['rst']}")
+        _service_saved_note(cfg, colours)
         return 0
 
-    print("usage: tgmessage service <add|remove|list> [unit ...]", file=sys.stderr)
+    # tgmessage service <unit> stop     -> reports only, never restarts it
+    # tgmessage service <unit> restart  -> back to the default (auto-restart)
+    unit = normalize_unit(rest[0]) if rest else ""
+    if unit and args and args[0].lower() in ("stop", "restart"):
+        mode = args[0].lower()
+        if unit not in cfg.watch_services:
+            print(
+                f"! {unit} is not in the watch list - add it first: tgmessage service add {unit}",
+                file=sys.stderr,
+            )
+            return 2
+        if mode == "stop":
+            cfg.service_no_restart = sorted(set(cfg.service_no_restart) | {unit})
+            note = "reports only now - the watcher will NOT restart it"
+        else:
+            cfg.service_no_restart = sorted(set(cfg.service_no_restart) - {unit})
+            note = "auto-restart is back on (default)"
+        write_env(cfg.home, {
+            "TG_SERVICE_NO_RESTART": ",".join(cfg.service_no_restart),
+        })
+        print(f"{unit}: {note}")
+        print(f"  TG_SERVICE_NO_RESTART={','.join(cfg.service_no_restart) or '(none)'}")
+        _service_saved_note(cfg, colours)
+        return 0
+
+    print(
+        "usage: tgmessage service <add|remove|rem|list> [unit ...]\n"
+        "       tgmessage service <unit> stop|restart",
+        file=sys.stderr,
+    )
     return 2
+
+
+def _service_saved_note(cfg, colours):
+    if notify_daemon(cfg, {"cmd": "reload"}):
+        print(f"{colours['dim']}daemon reloaded (no watcher restart needed - it re-reads .env every cycle){colours['rst']}")
+    else:
+        print(f"{colours['dim']}the watcher re-reads .env every cycle - no restart needed{colours['rst']}")
 
 
 def cmd_status(cfg, colours, rest):

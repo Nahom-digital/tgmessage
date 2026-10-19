@@ -17,7 +17,9 @@ every cycle the watcher makes sure that:
     correct time),
   * the systemd services YOU added with `tgmessage service add <name>` are
     enabled and running (restart + alert if not).  There is no hardcoded
-    service list: nothing is watched until you add it.
+    service list: nothing is watched until you add it.  A unit marked with
+    `tgmessage service <name> stop` is report-only - the watcher alerts when
+    it is down but never enables or restarts it.
   * the root filesystem is read-write (remounts it if the kernel flipped it
     to read-only after an I/O error),
   * the disk is not full (vacuums the systemd journal above DISK_WARN_PCT),
@@ -244,11 +246,25 @@ def watched_services() -> list:
     return out
 
 
+def no_restart_services() -> list:
+    """Watched units the user set to report-only (`tgmessage service <unit> stop`)."""
+    out = []
+    for chunk in split_ids(read_tg_env().get("TG_SERVICE_NO_RESTART")):
+        unit = normalize_unit(chunk)
+        if unit and unit not in out:
+            out.append(unit)
+    return out
+
+
 def enable_units() -> list:
-    """What the early boot pass should enable: the watcher itself + added services."""
+    """What the early boot pass should enable: the watcher itself + added services.
+
+    Report-only units are left alone: if they are disabled, we only tell the user.
+    """
     units = ["watcher.service", "watcher-boot.service"]
+    report_only = set(no_restart_services())
     for unit in watched_services():
-        if unit not in units:
+        if unit not in units and unit not in report_only:
             units.append(unit)
     return units
 
@@ -714,8 +730,10 @@ def restart_rate_ok(unit: str, min_gap: int = 300) -> bool:
 
 def check_services(repair: bool = True):
     problems = []
+    report_only = set(no_restart_services())
     for unit in watched_services():
         label = unit[: -len(".service")] if unit.endswith(".service") else unit
+        ro = unit in report_only
         try:
             enabled = unit_enabled(unit)
             if enabled == "not-found":
@@ -725,6 +743,12 @@ def check_services(repair: bool = True):
                            key="missing:%s" % unit, dedupe=86400)
                 continue
             if enabled in ("disabled", "masked", "bad"):
+                if ro:
+                    problems.append("%s is %s (notify-only)" % (label, enabled))
+                    if repair:
+                        notify("watcher: %s is %s - notify-only, I am not touching it" % (unit, enabled),
+                               key="reportonly-enabled:%s" % unit, dedupe=1800)
+                    continue
                 if not repair:
                     problems.append("%s is %s" % (label, enabled))
                     continue
@@ -737,6 +761,13 @@ def check_services(repair: bool = True):
 
             active = unit_active(unit)
             if active not in ("active", "activating"):
+                if ro:
+                    problems.append("%s (%s) is %s (notify-only)" % (label, unit, active))
+                    if repair:
+                        notify("watcher: %s (%s) is %s - notify-only, restart it yourself if you want"
+                               % (label, unit, active),
+                               key="reportonly-down:%s" % unit, dedupe=1800)
+                    continue
                 if not repair:
                     problems.append("%s (%s) is %s" % (label, unit, active))
                     continue
