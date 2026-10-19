@@ -74,8 +74,10 @@ tgmessage allow sys|mang <id> [...]    # raise the level
 tgmessage deny [sys|mang] <id> [...]   # lower/remove access
 
 tgmessage service add <unit> [...]     # watch a systemd service
-tgmessage service remove <unit> [...]  # stop watching
-tgmessage service list                 # show watched services
+tgmessage service remove <unit> [...]  # stop watching (alias: rem)
+tgmessage service <unit> stop          # report only - never auto-restart it
+tgmessage service <unit> restart       # back to auto-restart (default)
+tgmessage service list                 # show watched services + mode
 
 tgmessage log 40 [--chat 123]    # recent messages
 tgmessage status                 # token/service/socket/sessions health
@@ -101,7 +103,9 @@ repairs what it can and reports what it did to the `mang` chats:
 - **clock** - restarts NTP; if still wrong, sets the time from an HTTPS
   `Date:` header (dead CMOS battery on an old PC)
 - **services** - every unit you added with `tgmessage service add`: enables,
-  `reset-failed`s and restarts it (throttled), alerts if it stays down
+  `reset-failed`s and restarts it (throttled), alerts if it stays down. A
+  unit set to report-only with `tgmessage service <unit> stop` is never
+  touched - you only get a Telegram message when it is down.
 - **disk** - remounts a read-only rootfs `rw`, vacuums the journal when
   `DISK_WARN_PCT` is reached
 - **other failed units** - reported (not touched)
@@ -146,6 +150,7 @@ TG_ALLOWED_CHAT_IDS=...     # chat access
 TG_SYS_CHAT_IDS=...         # /status + /logs
 TG_MANG_CHAT_IDS=...        # watcher reports
 TG_WATCH_SERVICES=...       # services the watcher watches
+TG_SERVICE_NO_RESTART=...   # watched services it should only report (no restart)
 TG_DEFAULT_CHAT=...
 TG_HOST=127.0.0.1
 TG_PORT=8765
