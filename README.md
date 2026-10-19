@@ -110,6 +110,24 @@ repairs what it can and reports what it did to the `mang` chats:
   `DISK_WARN_PCT` is reached
 - **other failed units** - reported (not touched)
 
+### Watched services
+
+Nothing is watched until you add it - the list lives in `.env`, not in the
+code:
+
+```bash
+tgmessage service add nginx ssh  # watch: enable, restart when down, alert
+tgmessage service list           # state of each service + its mode
+tgmessage service nginx stop     # report only - alert, but never restart it
+tgmessage service nginx restart  # back to auto-restart (default)
+tgmessage service rem nginx      # remove it from the watch list
+```
+
+A newly added service gets auto-restart by default. `stop` is per unit and
+just sends you a Telegram message when it is down. Both live in
+`TG_WATCH_SERVICES` / `TG_SERVICE_NO_RESTART` and apply on the next watcher
+cycle - no watcher restart needed.
+
 Watcher messages go straight to the Bot API (token from `.env`), so they work
 even if the tgmessage daemon is down; while offline they queue in
 `watcher/state/outbox.jsonl`. Only `TG_MANG_CHAT_IDS` receive them.
