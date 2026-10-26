@@ -56,7 +56,7 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 
 | command | does |
 |---|---|
-| `/status` | server report: active downloads with ids + %, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
+| `/status` | server report: queued/active transfers with ids + %, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
 | `/cancel_upload <id>` | stop an active upload shown in `/status` and remove its partial file |
 | `/help` (`/start`) | list the commands |
@@ -77,8 +77,10 @@ sudo apt-get install -y cmake g++ gperf libssl-dev zlib1g-dev
 git clone --recursive https://github.com/tdlib/telegram-bot-api /opt/telegram-bot-api
 cmake -S /opt/telegram-bot-api -B /opt/telegram-bot-api/build \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-sudo cmake --build /opt/telegram-bot-api/build --target install -- -j1
+sudo nice -n 19 cmake --build /opt/telegram-bot-api/build --target install -- -j1
 ```
+
+`-j1` + `nice` keeps the one-time build from saturating a low-end CPU.
 
 Then save the app credentials from [my.telegram.org](https://my.telegram.org)
 (`API development tools`) and start everything with one command:
@@ -219,7 +221,7 @@ TG_API_HASH=
 TG_MAX_DOWNLOAD_MB=         # empty = 20 cloud / 2000 local
 TG_MAX_UPLOAD_MB=           # empty = 50 cloud / 2000 local
 TG_ALLOWED_CHAT_IDS=...     # chat access
-TG_SYS_CHAT_IDS=...         # /status + /logs
+TG_SYS_CHAT_IDS=...         # /status, /logs and /cancel_upload
 TG_MANG_CHAT_IDS=...        # watcher reports
 TG_WATCH_SERVICES=...       # services the watcher watches
 TG_SERVICE_NO_RESTART=...   # watched services it should only report (no restart)

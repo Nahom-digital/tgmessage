@@ -3243,7 +3243,7 @@ Type=simple
 EnvironmentFile=-{env_file(cfg.home)}
 ExecStart={binary} --api-id=${{TG_API_ID}} --api-hash=${{TG_API_HASH}} --local --http-ip-address=127.0.0.1 --http-port={cfg.local_api_port} --dir={cfg.local_api_dir}
 Restart=always
-RestartSec=3
+RestartSec=10
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
