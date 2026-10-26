@@ -338,6 +338,7 @@ def write_env(home, updates):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines).rstrip() + "\n")
+    os.chmod(tmp, 0o600)  # the file holds the bot token and API hash
     os.replace(tmp, path)
     return current
 
@@ -3235,6 +3236,32 @@ def local_api_ping(cfg, timeout=5):
         return False
 
 
+def local_api_logout(cfg, label):
+    """Log the bot out of the server currently serving `cfg`.
+
+    Telegram requires this before moving a bot between the cloud Bot API and a
+    local server; otherwise updates may be split between the two.
+    """
+    if not cfg.token:
+        print("! no bot token configured; cannot log out", file=sys.stderr)
+        return False
+    try:
+        result = Telegram(cfg).call("logOut", timeout=20)
+    except (TelegramError, OSError, ValueError) as exc:
+        print(f"! could not log out from {label}: {exc}", file=sys.stderr)
+        return False
+    if not result:
+        print(f"! {label} did not confirm the log out", file=sys.stderr)
+        return False
+    print(f"logged the bot out from {label}")
+    return True
+
+
+def local_api_disable_service():
+    if has_systemd() and os.path.exists(LOCAL_API_UNIT):
+        systemctl("disable", "--now", f"{LOCAL_API_SERVICE}.service")
+
+
 def local_api_install_service(cfg, colours):
     """Write + start telegram-bot-api.service. True when it is running."""
     c = colours
@@ -3269,7 +3296,7 @@ def local_api_install_service(cfg, colours):
     systemctl("daemon-reload")
     systemctl("enable", f"{LOCAL_API_SERVICE}.service")
     systemctl("restart", f"{LOCAL_API_SERVICE}.service")
-    for _ in range(20):
+    for _ in range(60):
         time.sleep(0.5)
         if local_api_service_state() == "active" and local_api_ping(cfg, timeout=2):
             print(f"{c['green']}local Bot API server is running{c['rst']} ({binary})")
@@ -3306,16 +3333,20 @@ def cmd_local_api(cfg, colours, rest):
         return 2
 
     if action in ("off", "disable", "cloud"):
+        if cfg.is_local_api:
+            service_stop(cfg)
+            if not local_api_logout(cfg, "the local Bot API server"):
+                print("! warning: could not log out from the local server", file=sys.stderr)
+        local_api_disable_service()
         write_env(cfg.home, {
             "TG_API_ROOT": "",
             "TG_MAX_DOWNLOAD_MB": None,
             "TG_MAX_UPLOAD_MB": None,
         })
-        if has_systemd() and os.path.exists(LOCAL_API_UNIT):
-            systemctl("disable", "--now", f"{LOCAL_API_SERVICE}.service")
         print("local Bot API disabled - using Telegram cloud (20 MB downloads)")
-        if unit_installed() or daemon_pid(cfg):
-            print(f"daemon restarted ({service_restart(Config(cfg.home))})")
+        cloud_cfg = Config(cfg.home)
+        if unit_installed() or daemon_pid(cloud_cfg):
+            print(f"daemon restarted ({service_restart(cloud_cfg)})")
         return 0
 
     if action in ("stop", "down"):
@@ -3366,15 +3397,48 @@ def cmd_local_api(cfg, colours, rest):
     cfg.api_id, cfg.api_hash = api_id, api_hash
     print(f"saved api_id {api_id} and api_hash ***{api_hash[-4:]} to {env_file(cfg.home)}")
 
+    was_local = cfg.is_local_api
+    if not was_local:
+        # Stop our cloud poller before starting the local server, then bring it
+        # back if setup fails. This avoids two tgmessage consumers racing.
+        service_stop(cfg)
     if not local_api_install_service(cfg, colours):
-        print("credentials saved, but tgmessage still uses the Telegram cloud API", file=sys.stderr)
+        if not was_local:
+            # Never leave a second poller behind if setup failed.
+            local_api_disable_service()
+            service_restart(Config(cfg.home))
+            print("credentials saved; tgmessage is back on the Telegram cloud API", file=sys.stderr)
+        else:
+            print("credentials saved, but the local Bot API is not ready", file=sys.stderr)
         return 1
 
-    write_env(cfg.home, {
-        "TG_API_ROOT": f"http://127.0.0.1:{cfg.local_api_port}",
-        "TG_MAX_DOWNLOAD_MB": "2000",
-        "TG_MAX_UPLOAD_MB": "2000",
-    })
+    # The local server is up: migrate the bot. If the cloud logout fails, the
+    # cloud config is restored and the local service is disabled again.
+    if not was_local:
+        local_root = f"http://127.0.0.1:{cfg.local_api_port}"
+        try:
+            write_env(cfg.home, {
+                "TG_API_ROOT": local_root,
+                "TG_MAX_DOWNLOAD_MB": "2000",
+                "TG_MAX_UPLOAD_MB": "2000",
+            })
+        except OSError as exc:
+            print(f"! cannot update {env_file(cfg.home)}: {exc}", file=sys.stderr)
+            local_api_disable_service()
+            service_restart(Config(cfg.home))
+            return 1
+        if not local_api_logout(cfg, "Telegram cloud"):
+            # Put the cloud config back; no daemon has been restarted yet.
+            write_env(cfg.home, {
+                "TG_API_ROOT": "",
+                "TG_MAX_DOWNLOAD_MB": None,
+                "TG_MAX_UPLOAD_MB": None,
+            })
+            local_api_disable_service()
+            print("! still using the Telegram cloud API", file=sys.stderr)
+            service_restart(Config(cfg.home))
+            return 1
+
     cfg.api_root = f"http://127.0.0.1:{cfg.local_api_port}"
     cfg.is_local_api = True
     cfg.max_download = 2000 * 1024 * 1024
