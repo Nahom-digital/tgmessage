@@ -61,15 +61,23 @@ Everything lives in TG_HOME (default /root/tgmessage):
         daemon.pid      pid, only when running without systemd
 
 Only the standard library is used. No pip installs.
+
+Large files: Telegram's cloud Bot API caps bot downloads at 20 MB.
+`tgmessage local-api <api_id> <api_hash>` configures the optional local
+Bot API server (tdlib/telegram-bot-api), which serves files from local disk
+and lifts the cap to 2 GB. Incoming files are downloaded through one ordered
+queue, so a low-end machine only transfers one file at a time.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
 import mimetypes
 import os
+import queue
 import re
 import select
 import shlex
@@ -87,9 +95,23 @@ import urllib.request
 import uuid
 
 DEFAULT_HOME = "/root/tgmessage"
-API_TMPL = "https://api.telegram.org/bot{token}/{method}"
+DEFAULT_API_ROOT = "https://api.telegram.org"
+LOCAL_API_PORT = 8081
+LOCAL_API_SERVICE = "telegram-bot-api"
+LOCAL_API_UNIT = "/etc/systemd/system/telegram-bot-api.service"
+LOCAL_API_BIN = "/usr/local/bin/telegram-bot-api"
 SERVICE_NAME = "tgmessage"
-MAX_FILE = 50 * 1024 * 1024  # Telegram bot API hard limit for uploads
+MAX_FILE = 50 * 1024 * 1024  # Telegram cloud Bot API limit for uploads
+
+
+def api_root(cfg):
+    """The Bot API root in use (official cloud or a local server)."""
+    return (getattr(cfg, "api_root", "") or DEFAULT_API_ROOT).rstrip("/")
+
+
+def api_url(cfg, method, token=None):
+    return f"{api_root(cfg)}/bot{token or cfg.token}/{method}"
+
 
 C = {
     "rst": "\033[0m",
@@ -216,6 +238,13 @@ def osc52(text):
 
 ENV_TEMPLATE = [
     ("TG_BOT_TOKEN", "", "BotFather token, looks like 123456789:AA........"),
+    ("TG_API_ROOT", "", "Bot API root; empty = Telegram cloud, local server: http://127.0.0.1:8081"),
+    ("TG_API_ID", "", "Telegram api_id for the local Bot API server (my.telegram.org)"),
+    ("TG_API_HASH", "", "Telegram api_hash for the local Bot API server"),
+    ("TG_LOCAL_API_PORT", "8081", "local Bot API server port"),
+    ("TG_LOCAL_API_DIR", "/var/lib/telegram-bot-api", "local Bot API server file storage"),
+    ("TG_MAX_DOWNLOAD_MB", "", "max download size in MB (default: 20 cloud, 2000 local)"),
+    ("TG_MAX_UPLOAD_MB", "", "max upload size in MB (default: 50 cloud, 2000 local)"),
     ("TG_ALLOWED_CHAT_IDS", "", "chat ids allowed to talk to this bot"),
     ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status, /logs and /cancel_upload (tgmessage allow sys)"),
     ("TG_MANG_CHAT_IDS", "", "chat ids that receive watcher reports (tgmessage allow mang)"),
@@ -339,6 +368,23 @@ class Config:
             self.default_chat = self.allowed[0]
         self.host = get("TG_HOST", "127.0.0.1")
         self.port = int(get("TG_PORT", "8765") or 8765)
+        self.api_root = get("TG_API_ROOT").strip().rstrip("/")
+        self.api_id = get("TG_API_ID").strip()
+        self.api_hash = get("TG_API_HASH").strip()
+        self.local_api_port = int(get("TG_LOCAL_API_PORT", str(LOCAL_API_PORT)) or LOCAL_API_PORT)
+        self.local_api_dir = os.path.abspath(os.path.expanduser(
+            get("TG_LOCAL_API_DIR") or "/var/lib/telegram-bot-api"))
+        self.is_local_api = bool(self.api_root) and "api.telegram.org" not in self.api_root
+        default_download_mb = 2000 if self.is_local_api else 20
+        default_upload_mb = 2000 if self.is_local_api else 50
+        try:
+            self.max_download = max(1, int(get("TG_MAX_DOWNLOAD_MB", str(default_download_mb)))) * 1024 * 1024
+        except ValueError:
+            self.max_download = default_download_mb * 1024 * 1024
+        try:
+            self.max_upload = max(1, int(get("TG_MAX_UPLOAD_MB", str(default_upload_mb)))) * 1024 * 1024
+        except ValueError:
+            self.max_upload = default_upload_mb * 1024 * 1024
         self.history = int(get("TG_HISTORY", "300") or 300)
         self.poll_timeout = int(get("TG_POLL_TIMEOUT", "30") or 30)
         self.state_dir = os.path.join(self.home, "state")
@@ -466,7 +512,7 @@ class Telegram:
     def _post(self, method, data, headers=None, timeout=45):
         if not self.cfg.token:
             raise TelegramError("no bot token configured yet")
-        url = API_TMPL.format(token=self.cfg.token, method=method)
+        url = api_url(self.cfg, method)
         hdrs = {"User-Agent": "tgmessage/1.0"}
         if headers:
             hdrs.update(headers)
@@ -517,6 +563,13 @@ class Telegram:
     def send_document(self, chat_id, path, caption=None):
         """Upload a file with sendDocument (multipart/form-data, stdlib only)."""
         filename = os.path.basename(path)
+        if getattr(self.cfg, "is_local_api", False):
+            # A local Bot API server accepts a local path instead of loading the
+            # whole file into memory, so large uploads work too.
+            params = {"chat_id": str(chat_id), "document": "file://" + urllib.parse.quote(path)}
+            if caption:
+                params["caption"] = caption[:1024]
+            return self.call("sendDocument", params, timeout=3600)
         # A CR/LF or quote in the name would break the part headers.
         safe_name = filename.replace("\r", " ").replace("\n", " ").replace('"', "'")
         ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -556,20 +609,72 @@ class Telegram:
 
     def get_file(self, file_id):
         """Ask Telegram for the server path of a file (getFile)."""
-        return self.call("getFile", {"file_id": file_id}, timeout=30)
+        timeout = 300 if getattr(self.cfg, "is_local_api", False) else 30
+        return self.call("getFile", {"file_id": file_id}, timeout=timeout)
+
+    @staticmethod
+    def _copy_local_file(src, dest_path, progress=None, cancelled=None):
+        """Copy a file already stored by a local Bot API server."""
+        if not os.path.isfile(src):
+            raise TelegramError(f"local Bot API file not found: {src}")
+        total = os.path.getsize(src)
+        if cancelled and cancelled():
+            raise DownloadCancelled()
+        # Same filesystem: hard-link instead of copying gigabytes of data.
+        try:
+            os.link(src, dest_path)
+        except OSError:
+            pass
+        else:
+            if progress:
+                try:
+                    progress(total, total)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        done = 0
+        with open(src, "rb") as inp, open(dest_path, "wb") as out:
+            while True:
+                if cancelled and cancelled():
+                    raise DownloadCancelled()
+                chunk = inp.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress:
+                    try:
+                        progress(done, total)
+                    except Exception:  # noqa: BLE001 - never abort a download
+                        pass
+        if progress:
+            try:
+                progress(done, total)
+            except Exception:  # noqa: BLE001
+                pass
 
     def download_file(self, server_path, dest_path, progress=None, cancelled=None):
         """Download a file from Telegram's servers to dest_path (stdlib only).
 
-        progress(done, total), when given, is called after every 64 KiB chunk.
+        progress(done, total), when given, is called after every chunk.
         total is 0 when the server does not report a Content-Length.
         cancelled(), when given, is checked before every chunk; returning True
         aborts the transfer with DownloadCancelled.
+
+        A local Bot API server started with --local returns an absolute path
+        instead of a relative download path; those files are copied from disk
+        directly, which is what lifts the cloud API's 20 MB download limit.
         """
         if not self.cfg.token:
             raise TelegramError("no bot token configured yet")
-        url = "https://api.telegram.org/file/bot{token}/{path}".format(
-            token=self.cfg.token, path=urllib.parse.quote(server_path))
+        if os.path.isabs(server_path):
+            self._copy_local_file(server_path, dest_path, progress, cancelled)
+            return
+        url = "{root}/file/bot{token}/{path}".format(
+            root=api_root(self.cfg),
+            token=self.cfg.token,
+            path=urllib.parse.quote(server_path),
+        )
         req = urllib.request.Request(url, headers={"User-Agent": "tgmessage/1.0"})
         try:
             with urllib.request.urlopen(req, timeout=300) as resp, \
@@ -848,9 +953,20 @@ def start_download(name, chat_id=None, total=None):
             "done": 0,
             "total": int(total or 0),
             "started": time.time(),
+            "state": "queued",
             "cancelled": False,
         }
     return key
+
+
+def begin_download(key):
+    """Mark a queued transfer as the one currently downloading."""
+    with _active_downloads_lock:
+        rec = _active_downloads.get(key)
+        if rec is None:
+            return
+        rec["state"] = "downloading"
+        rec["started"] = time.time()
 
 
 def update_download(key, done, total=None):
@@ -874,8 +990,13 @@ def cancel_download(key):
         rec = _active_downloads.get(key)
         if rec is None:
             return None
-        rec["cancelled"] = True
-        return dict(rec)
+        snapshot = dict(rec)
+        if rec.get("state") == "queued":
+            # The worker has not started it yet; drop it from the queue view now.
+            _active_downloads.pop(key, None)
+        else:
+            rec["cancelled"] = True
+        return snapshot
 
 
 def download_cancelled(key):
@@ -897,12 +1018,14 @@ def downloads_status_lines():
     if not downloads:
         return []
     lines = [
-        f"downloads: {len(downloads)} active (cancel with /cancel_upload <id>)"
+        f"downloads: {len(downloads)} queued/active (cancel with /cancel_upload <id>)"
     ]
     for rec in downloads:
         done = rec.get("done") or 0
         total = rec.get("total") or 0
-        if total:
+        if rec.get("state") == "queued":
+            detail = "queued"
+        elif total:
             pct = max(0, min(100, int(done * 100 / total)))
             detail = f"{pct}% ({human_size(done)} / {human_size(total)})"
         else:
@@ -1219,6 +1342,16 @@ def system_status_text(cfg):
         pass
     lines.append(line)
 
+    if getattr(cfg, "is_local_api", False):
+        lines.append(
+            f"Bot API: local ({api_root(cfg)}) | files up to "
+            f"{human_size(getattr(cfg, 'max_download', 0))}"
+        )
+    else:
+        lines.append(
+            f"Bot API: cloud | files up to {human_size(getattr(cfg, 'max_download', 20 * 1024 * 1024))}"
+        )
+
     download_lines = downloads_status_lines()
     if download_lines:
         lines.append("")
@@ -1412,8 +1545,13 @@ def chat_help_text(cfg, is_sys=False):
         "",
         "Send a photo or any file (.sh, .txt, .zip, ...) and it is saved to:",
         f"  {cfg.files_dir}",
-        "You get a confirmation with the saved path. Files up to 20 MB",
-        "can be downloaded (Telegram Bot API limit).",
+        "You get a confirmation with the saved path. Files up to "
+        f"{human_size(getattr(cfg, 'max_download', 20 * 1024 * 1024))} can be downloaded "
+        f"({'local Bot API server' if getattr(cfg, 'is_local_api', False) else 'Telegram cloud Bot API'}).",
+    ]
+    if not getattr(cfg, "is_local_api", False):
+        lines.append("For larger files set up the local Bot API server: tgmessage local-api")
+    lines += [
         "",
         "The terminal UI additionally has /session, /allow, /deny,",
         "/requests, /copy and /file <path>.",
@@ -1445,6 +1583,7 @@ class Daemon:
         self.send_lock = threading.Lock()
         self.seen = set()
         self.running = True
+        self.download_queue = queue.Queue()
 
     # ---- state -------------------------------------------------------
     def _load_offset(self):
@@ -1804,6 +1943,8 @@ class Daemon:
         rec = cancel_download(upload_id)
         if rec is None:
             text = f"no active upload with id {upload_id} - use /status to list them"
+        elif rec.get("state") == "queued":
+            text = f"cancelled queued upload #{upload_id}: {rec.get('name') or 'file'}"
         else:
             done = rec.get("done") or 0
             total = rec.get("total") or 0
@@ -1820,66 +1961,99 @@ class Daemon:
 
     # ---- incoming files: saved into <home>/files ----------------------
     def maybe_save_media(self, cid, msg):
-        """Any photo/file/audio/video a user sends is downloaded to files_dir."""
+        """Queue any photo/file/audio/video for download to files_dir."""
         info = incoming_media(msg)
         if not info:
             return
-        threading.Thread(target=self._save_media, args=(cid, *info), daemon=True).start()
-
-    def _save_media(self, cid, file_id, name, size, kind):
+        file_id, name, size, kind = info
         name = safe_filename(name)
-        dest_dir = self.cfg.files_dir
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-        except OSError as exc:
-            log(self.cfg, f"cannot create {dest_dir}: {exc}")
-            return
-        if size and size > 20 * 1024 * 1024:
-            note = (f"not saved: {name} is {human_size(size)} - the Bot API only "
-                    f"lets me download files up to 20 MB")
-            log(self.cfg, note)
-            self._record_out(cid, note)
-            return
         key = start_download(name, cid, size)
+        self.download_queue.put((cid, file_id, name, size, kind, key))
+
+    def _download_worker(self):
+        """Download one file at a time, in arrival order (low-end friendly)."""
+        try:
+            os.nice(10)  # keep large transfers from starving the rest of the box
+        except (AttributeError, OSError):
+            pass
+        while self.running:
+            try:
+                item = self.download_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._save_media(*item)
+            except Exception as exc:  # noqa: BLE001 - one file must not kill the queue
+                log(self.cfg, f"download worker error: {exc!r}")
+            finally:
+                self.download_queue.task_done()
+
+    def _save_media(self, cid, file_id, name, size, kind, key=None):
+        name = safe_filename(name)
+        if key is None:
+            key = start_download(name, cid, size)
         dest = None
         try:
             if download_cancelled(key):
-                raise DownloadCancelled()
-            meta = self.tg.get_file(file_id)
-            server_path = (meta or {}).get("file_path")
-            if not server_path:
-                raise TelegramError("getFile returned no file_path")
-            if not size:
-                size = (meta or {}).get("file_size")
-                if size:
-                    update_download(key, 0, size)
-            dest = unique_path(dest_dir, name)
-            self.tg.download_file(
-                server_path,
-                dest,
-                progress=lambda done, total: update_download(key, done, total),
-                cancelled=lambda: download_cancelled(key),
-            )
-            if download_cancelled(key):
-                raise DownloadCancelled()
-        except DownloadCancelled:
+                log(self.cfg, f"cancelled queued upload #{key} {name}")
+                return
+            begin_download(key)
+            dest_dir = self.cfg.files_dir
             try:
-                if dest:
-                    os.remove(dest)
-            except OSError:
-                pass
-            log(self.cfg, f"cancelled upload #{key} {name}")
-            return
-        except (TelegramError, OSError) as exc:
-            note = f"not saved: {name} ({exc})"
-            log(self.cfg, note)
-            self._record_out(cid, note)
-            return
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError as exc:
+                log(self.cfg, f"cannot create {dest_dir}: {exc}")
+                return
+            limit = getattr(self.cfg, "max_download", 20 * 1024 * 1024)
+            if size and size > limit:
+                if getattr(self.cfg, "is_local_api", False):
+                    note = (f"not saved: {name} is {human_size(size)} - the local Bot API "
+                            f"limit is {human_size(limit)} per file")
+                else:
+                    note = (f"not saved: {name} is {human_size(size)} - Telegram's cloud Bot API "
+                            f"only lets bots download files up to {human_size(limit)}. "
+                            f"Set up the local Bot API server with: tgmessage local-api")
+                log(self.cfg, note)
+                self._record_out(cid, note)
+                return
+            try:
+                if download_cancelled(key):
+                    raise DownloadCancelled()
+                meta = self.tg.get_file(file_id)
+                server_path = (meta or {}).get("file_path")
+                if not server_path:
+                    raise TelegramError("getFile returned no file_path")
+                if not size:
+                    size = (meta or {}).get("file_size")
+                    if size:
+                        update_download(key, 0, size)
+                dest = unique_path(dest_dir, name)
+                self.tg.download_file(
+                    server_path,
+                    dest,
+                    progress=lambda done, total: update_download(key, done, total),
+                    cancelled=lambda: download_cancelled(key),
+                )
+                if download_cancelled(key):
+                    raise DownloadCancelled()
+            except DownloadCancelled:
+                try:
+                    if dest:
+                        os.remove(dest)
+                except OSError:
+                    pass
+                log(self.cfg, f"cancelled upload #{key} {name}")
+                return
+            except (TelegramError, OSError) as exc:
+                note = f"not saved: {name} ({exc})"
+                log(self.cfg, note)
+                self._record_out(cid, note)
+                return
+            saved = os.path.getsize(dest)
+            log(self.cfg, f"saved {kind} {name} ({human_size(saved)}) -> {dest}")
+            self._record_out(cid, f"saved: {dest} ({human_size(saved)})")
         finally:
             finish_download(key)
-        saved = os.path.getsize(dest)
-        log(self.cfg, f"saved {kind} {name} ({human_size(saved)}) -> {dest}")
-        self._record_out(cid, f"saved: {dest} ({human_size(saved)})")
 
     # ---- socket server -----------------------------------------------
     def serve(self):
@@ -2035,13 +2209,14 @@ class Daemon:
             self.send(conn, {"type": "ack", "ok": False, "error": f"chat {cid} is not allowed - allow it with: tgmessage allow {cid}"})
             return
         size = os.path.getsize(path)
-        if size > MAX_FILE:
+        limit = getattr(self.cfg, "max_upload", MAX_FILE)
+        if size > limit:
             self.send(
                 conn,
                 {
                     "type": "ack",
                     "ok": False,
-                    "error": f"file is {human_size(size)}; Telegram bots can send up to {human_size(MAX_FILE)}",
+                    "error": f"file is {human_size(size)}; the Bot API in use allows up to {human_size(limit)}",
                 },
             )
             return
@@ -2091,6 +2266,7 @@ class Daemon:
         )
         self._write_pid()
         threading.Thread(target=self.poll_loop, daemon=True).start()
+        threading.Thread(target=self._download_worker, daemon=True).start()
         threading.Thread(target=self.refresh_allowed, daemon=True).start()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self._stop)
@@ -3006,6 +3182,210 @@ def service_restart(cfg):
 
 
 # --------------------------------------------------------------------------
+# local Bot API server (lifts the 20 MB download limit)
+# --------------------------------------------------------------------------
+
+
+def local_api_bin():
+    return shutil.which("telegram-bot-api") or LOCAL_API_BIN
+
+
+def local_api_unit_text(cfg):
+    binary = local_api_bin()
+    return f"""\
+[Unit]
+Description=Local Telegram Bot API server for tgmessage
+Documentation=https://github.com/tdlib/telegram-bot-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-{env_file(cfg.home)}
+ExecStart={binary} --api-id=${{TG_API_ID}} --api-hash=${{TG_API_HASH}} --local --http-ip-address=127.0.0.1 --http-port={cfg.local_api_port} --dir={cfg.local_api_dir}
+Restart=always
+RestartSec=3
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def local_api_service_state():
+    if not has_systemd() or not os.path.exists(LOCAL_API_UNIT):
+        return "not installed"
+    state = systemctl("is-active", f"{LOCAL_API_SERVICE}.service").stdout.strip()
+    return state or "unknown"
+
+
+def local_api_ping(cfg, timeout=5):
+    """True when the local server answers getMe for our token."""
+    if not cfg.token:
+        return False
+    url = f"http://127.0.0.1:{cfg.local_api_port}/bot{cfg.token}/getMe"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            payload = json.load(resp)
+        return bool(payload.get("ok"))
+    except (OSError, ValueError):
+        return False
+
+
+def local_api_install_service(cfg, colours):
+    """Write + start telegram-bot-api.service. True when it is running."""
+    c = colours
+    if os.geteuid() != 0:
+        print("! the local Bot API service needs root - run this with sudo", file=sys.stderr)
+        return False
+    if not has_systemd():
+        print("! systemd is required to run the local Bot API server", file=sys.stderr)
+        return False
+    binary = shutil.which("telegram-bot-api")
+    if not binary and os.path.isfile(LOCAL_API_BIN):
+        binary = LOCAL_API_BIN
+    if not binary:
+        print(
+            f"! {LOCAL_API_BIN} is not installed yet.\n"
+            "  Build it from https://github.com/tdlib/telegram-bot-api "
+            "or use the installer in the project README.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        os.makedirs(cfg.local_api_dir, exist_ok=True)
+        os.chmod(cfg.local_api_dir, 0o700)
+        tmp = LOCAL_API_UNIT + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(local_api_unit_text(cfg))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, LOCAL_API_UNIT)
+    except OSError as exc:
+        print(f"! cannot write {LOCAL_API_UNIT}: {exc}", file=sys.stderr)
+        return False
+    systemctl("daemon-reload")
+    systemctl("enable", f"{LOCAL_API_SERVICE}.service")
+    systemctl("restart", f"{LOCAL_API_SERVICE}.service")
+    for _ in range(20):
+        time.sleep(0.5)
+        if local_api_service_state() == "active" and local_api_ping(cfg, timeout=2):
+            print(f"{c['green']}local Bot API server is running{c['rst']} ({binary})")
+            return True
+        if local_api_service_state() in ("failed", "inactive"):
+            break
+    print(
+        f"! {LOCAL_API_SERVICE}.service did not become ready.\n"
+        f"  see: journalctl -u {LOCAL_API_SERVICE} -n 50",
+        file=sys.stderr,
+    )
+    return False
+
+
+def cmd_local_api(cfg, colours, rest):
+    c = colours
+    action = (rest[0].strip().lower() if rest else "")
+
+    if action in ("status", "show"):
+        binary = shutil.which("telegram-bot-api")
+        print(f"{c['b']}local Bot API{c['rst']}")
+        print(f"  binary        {binary or LOCAL_API_BIN + ' (MISSING)'}")
+        print(f"  service       {local_api_service_state()}")
+        print(f"  api id        {cfg.api_id or '(not set)'}")
+        print(f"  api hash      {'***' + cfg.api_hash[-4:] if cfg.api_hash else '(not set)'}")
+        print(f"  api root      {cfg.api_root or 'Telegram cloud (default)'}")
+        print(f"  storage       {cfg.local_api_dir}")
+        print(f"  downloads     up to {human_size(cfg.max_download)}")
+        print(f"  uploads       up to {human_size(cfg.max_upload)}")
+        return 0
+
+    if os.geteuid() != 0:
+        print("! run this command with sudo (it writes .env and systemd units)", file=sys.stderr)
+        return 2
+
+    if action in ("off", "disable", "cloud"):
+        write_env(cfg.home, {
+            "TG_API_ROOT": "",
+            "TG_MAX_DOWNLOAD_MB": None,
+            "TG_MAX_UPLOAD_MB": None,
+        })
+        if has_systemd() and os.path.exists(LOCAL_API_UNIT):
+            systemctl("disable", "--now", f"{LOCAL_API_SERVICE}.service")
+        print("local Bot API disabled - using Telegram cloud (20 MB downloads)")
+        if unit_installed() or daemon_pid(cfg):
+            print(f"daemon restarted ({service_restart(Config(cfg.home))})")
+        return 0
+
+    if action in ("stop", "down"):
+        if has_systemd() and os.path.exists(LOCAL_API_UNIT):
+            systemctl("stop", f"{LOCAL_API_SERVICE}.service")
+        print(f"{LOCAL_API_SERVICE}.service: stopped")
+        return 0
+
+    api_id, api_hash = "", ""
+    if action in ("set", "save") and len(rest) >= 3:
+        api_id, api_hash = rest[1].strip(), rest[2].strip()
+    elif len(rest) >= 2:
+        api_id, api_hash = rest[0].strip(), rest[1].strip()
+    elif not rest and sys.stdin.isatty():
+        print("Telegram API credentials: https://my.telegram.org -> API development tools")
+        api_id = input("  api_id: ").strip()
+        api_hash = getpass.getpass("  api_hash (hidden): ").strip()
+    elif action in ("install", "setup", "start", "on"):
+        api_id, api_hash = cfg.api_id, cfg.api_hash
+        if not api_id or not api_hash:
+            print(
+                "no API credentials saved yet - run: tgmessage local-api <api_id> <api_hash>",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        print(
+            "usage: tgmessage local-api <api_id> <api_hash>\n"
+            "       tgmessage local-api status|off|stop",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not looks_like_id(api_id):
+        print("! api_id must be a number - copy it from https://my.telegram.org", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash or ""):
+        print("! api_hash must be the 32-character value from https://my.telegram.org", file=sys.stderr)
+        return 2
+
+    # Save the keys first. TG_API_ROOT is switched on only after the server
+    # is confirmed reachable, so a failed setup leaves the cloud API working.
+    write_env(cfg.home, {"TG_API_ID": api_id, "TG_API_HASH": api_hash})
+    try:
+        os.chmod(env_file(cfg.home), 0o600)
+    except OSError:
+        pass
+    cfg.api_id, cfg.api_hash = api_id, api_hash
+    print(f"saved api_id {api_id} and api_hash ***{api_hash[-4:]} to {env_file(cfg.home)}")
+
+    if not local_api_install_service(cfg, colours):
+        print("credentials saved, but tgmessage still uses the Telegram cloud API", file=sys.stderr)
+        return 1
+
+    write_env(cfg.home, {
+        "TG_API_ROOT": f"http://127.0.0.1:{cfg.local_api_port}",
+        "TG_MAX_DOWNLOAD_MB": "2000",
+        "TG_MAX_UPLOAD_MB": "2000",
+    })
+    cfg.api_root = f"http://127.0.0.1:{cfg.local_api_port}"
+    cfg.is_local_api = True
+    cfg.max_download = 2000 * 1024 * 1024
+    cfg.max_upload = 2000 * 1024 * 1024
+    print(f"{c['green']}large files enabled{c['rst']}: up to {human_size(cfg.max_download)}")
+    if unit_installed() or daemon_pid(cfg):
+        print(f"daemon restarted ({service_restart(Config(cfg.home))})")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
@@ -3044,6 +3424,9 @@ tgmessage - Telegram from any terminal, one session per chat.
 
   tgmessage --token <token>      save a (new) bot token, restart the daemon
   tgmessage --port <port>        change the daemon port, restart the daemon
+
+  tgmessage local-api <id> <hash>  set up local Bot API (files up to 2 GB, sudo)
+  tgmessage local-api status|off   show or disable the local Bot API
 
   tgmessage install [--token T]  install the systemd service + /usr/local/bin link
   tgmessage uninstall            remove service + link
@@ -3143,6 +3526,9 @@ def cmd_token(cfg, colours, rest):
     print(f"  TG_DEFAULT_CHAT={cfg.default_chat or '(none)'}")
     print(f"  TG_HOST={cfg.host}")
     print(f"  TG_PORT={cfg.port}")
+    print(f"  TG_API_ROOT={cfg.api_root or '(Telegram cloud)'}")
+    print(f"  TG_MAX_DOWNLOAD_MB={cfg.max_download // (1024 * 1024)}")
+    print(f"  TG_MAX_UPLOAD_MB={cfg.max_upload // (1024 * 1024)}")
     return 0
 
 
@@ -3416,6 +3802,9 @@ def cmd_status(cfg, colours, rest):
     print(f"  services      {', '.join(cfg.watch_services) or '(none - tgmessage service add)'}")
     print(f"  default chat  {cfg.default_chat or '(none)'}")
     print(f"  listening     {cfg.host}:{cfg.port}")
+    print(f"  bot api       {cfg.api_root or 'Telegram cloud'}  (files up to {human_size(cfg.max_download)})")
+    if cfg.is_local_api:
+        print(f"  local api     {local_api_service_state()}")
 
     up = reachable(cfg)
     if has_systemd() and unit_installed():
@@ -3534,6 +3923,8 @@ COMMANDS = {
     "deny": cmd_deny,
     "service": cmd_service,
     "services": lambda cfg, colours, rest: cmd_service(cfg, colours, ["list"]),
+    "local-api": cmd_local_api,
+    "localapi": cmd_local_api,
     "status": cmd_status,
     "log": cmd_log,
     "up": cmd_up,
