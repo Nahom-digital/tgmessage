@@ -30,6 +30,12 @@ tgmessage status                  # bridge health
 watcher check                     # machine health
 ```
 
+Large files (>20 MB) need the optional local Bot API server:
+
+```bash
+sudo tgmessage local-api <api_id> <api_hash>   # see "Large files" below
+```
+
 ## Permissions
 
 `tgmessage allow <id>` only lets that chat talk to the bot. Higher levels are
@@ -55,6 +61,40 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 | `/cancel_upload <id>` | stop an active upload shown in `/status` and remove its partial file |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
+
+## Large files (optional local Bot API)
+
+Telegram's **cloud** Bot API only lets bots download files up to 20 MB. This is
+a server-side Telegram limit, not a tgmessage setting. For larger files
+(Telegram allows up to 2 GB per file), run Telegram's official local Bot API
+server on the same machine. It stores the file locally, so tgmessage can copy
+it from disk without the cloud download cap.
+
+Build it once:
+
+```bash
+sudo apt-get install -y cmake g++ gperf libssl-dev zlib1g-dev
+git clone --recursive https://github.com/tdlib/telegram-bot-api /opt/telegram-bot-api
+cmake -S /opt/telegram-bot-api -B /opt/telegram-bot-api/build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+sudo cmake --build /opt/telegram-bot-api/build --target install -- -j1
+```
+
+Then save the app credentials from [my.telegram.org](https://my.telegram.org)
+(`API development tools`) and start everything with one command:
+
+```bash
+sudo tgmessage local-api <api_id> <api_hash>
+tgmessage local-api status          # binary, service, API root, size limits
+sudo tgmessage local-api off        # go back to the cloud API
+```
+
+The command stores `TG_API_ID` / `TG_API_HASH` in `.env` (mode 600), installs
+`telegram-bot-api.service`, points tgmessage at `http://127.0.0.1:8081`, and
+restarts the daemon. Downloads are written in 256 KiB chunks and handled by
+**one ordered worker** (one file at a time), so large files do not exhaust RAM
+or saturate a low-end CPU. `/status` shows queued and active transfers with
+their ids; `/cancel_upload <id>` cancels either one.
 
 ## Terminal commands
 
@@ -82,6 +122,8 @@ tgmessage service list                 # show watched services + mode
 
 tgmessage log 40 [--chat 123]    # recent messages
 tgmessage status                 # token/service/socket/sessions health
+tgmessage local-api <id> <hash>  # local Bot API: files up to 2 GB (sudo)
+tgmessage local-api status|off   # inspect or disable the local Bot API
 tgmessage up | down | restart    # control the daemon by hand
 watcher check                    # machine health report (no changes)
 watcher once                     # full check WITH repairs + alerts
@@ -146,6 +188,7 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
     tgmessage.service.in systemd unit template
     install.sh           installer / uninstaller
     files/               files/photos received from Telegram
+    /var/lib/telegram-bot-api/  local Bot API file store (optional)
     watcher/
         watcher.py         the caretaker (network/clock/DNS/disk/services)
         watcher.sh         shell front-end (also /usr/local/bin/watcher)
@@ -165,6 +208,11 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
 
 ```
 TG_BOT_TOKEN=...
+TG_API_ROOT=                # empty = cloud; local: http://127.0.0.1:8081
+TG_API_ID=                  # local Bot API credentials (my.telegram.org)
+TG_API_HASH=
+TG_MAX_DOWNLOAD_MB=         # empty = 20 cloud / 2000 local
+TG_MAX_UPLOAD_MB=           # empty = 50 cloud / 2000 local
 TG_ALLOWED_CHAT_IDS=...     # chat access
 TG_SYS_CHAT_IDS=...         # /status + /logs
 TG_MANG_CHAT_IDS=...        # watcher reports
@@ -194,6 +242,10 @@ journalctl -u watcher -n 50      # or: tail -f watcher/logs/watcher.log
 - **daemon not reachable** - `tgmessage up`.
 - **token rejected** - re-copy it from BotFather and run
   `tgmessage --token '<token>'`.
+- **files over 20 MB are rejected** - the cloud Bot API limit:
+  `sudo tgmessage local-api <api_id> <api_hash>`, then check
+  `tgmessage local-api status` and `journalctl -u telegram-bot-api -n 50`.
+- **local Bot API stopped** - `sudo systemctl restart telegram-bot-api`.
 
 ## Uninstall
 

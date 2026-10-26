@@ -55,7 +55,8 @@ if [ "$DO_UNINSTALL" = 1 ]; then
   say "uninstalling tgmessage"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now tgmessage.service 2>/dev/null || true
-    rm -f "$UNIT"
+    systemctl disable --now telegram-bot-api.service 2>/dev/null || true
+    rm -f "$UNIT" /etc/systemd/system/telegram-bot-api.service
     systemctl daemon-reload 2>/dev/null || true
   fi
   [ -L "$BIN_LINK" ] && rm -f "$BIN_LINK"
@@ -174,6 +175,7 @@ cat <<EOF
   tgmessage allow mang <id>         send watcher reports to a chat
   tgmessage service add <name>      watch a systemd service
   tgmessage status                  health check of the bot bridge
+  tgmessage local-api <id> <hash>   optional: local Bot API, files up to 2 GB
   watcher check                     machine health report (network, clock, disk)
   watcher log                       follow the watcher log (or send /logs to the bot)
 EOF
