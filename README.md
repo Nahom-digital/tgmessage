@@ -33,7 +33,7 @@ watcher check                     # machine health
 Large files (>20 MB) need the optional local Bot API server:
 
 ```bash
-sudo tgmessage local-api <api_id> <api_hash>   # see "Large files" below
+sudo tgmessage local-api <api_id> <api_hash>   # see "Local Bot API" below
 ```
 
 ## Permissions
@@ -58,19 +58,19 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 |---|---|
 | `/status` | server report: queued/active transfers with ids + %, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
-| `/cancel_upload <id>` | stop an active upload shown in `/status` and remove its partial file |
+| `/cancel_upload <id>` | stop a queued/active transfer shown in `/status` and remove its partial file |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
 
-## Large files (optional local Bot API)
+## Local Bot API (large files)
 
 Telegram's **cloud** Bot API only lets bots download files up to 20 MB. This is
-a server-side Telegram limit, not a tgmessage setting. For larger files
-(Telegram allows up to 2 GB per file), run Telegram's official local Bot API
-server on the same machine. It stores the file locally, so tgmessage can copy
-it from disk without the cloud download cap.
+a server-side Telegram limit, not a tgmessage setting. The official local Bot
+API server removes that download cap (uploads up to 2 GB are supported too).
+It runs beside tgmessage on the same machine and stores incoming files in
+`TG_LOCAL_API_DIR`, so tgmessage can read them directly from disk.
 
-Build it once:
+### Build the server once
 
 ```bash
 sudo apt-get install -y cmake g++ gperf libssl-dev zlib1g-dev
@@ -82,8 +82,10 @@ sudo nice -n 19 cmake --build /opt/telegram-bot-api/build --target install -- -j
 
 `-j1` + `nice` keeps the one-time build from saturating a low-end CPU.
 
-Then save the app credentials from [my.telegram.org](https://my.telegram.org)
-(`API development tools`) and start everything with one command:
+### Enable it
+
+Create an app at [my.telegram.org](https://my.telegram.org)
+(`API development tools`) and copy its **api_id** / **api_hash**. Then run:
 
 ```bash
 sudo tgmessage local-api <api_id> <api_hash>
@@ -91,17 +93,59 @@ tgmessage local-api status          # binary, service, API root, size limits
 sudo tgmessage local-api off        # go back to the cloud API
 ```
 
-The command stores `TG_API_ID` / `TG_API_HASH` in `.env` (mode 600), installs
-`telegram-bot-api.service`, stops tgmessage, logs the bot out of the cloud Bot
-API (the required Telegram handoff), and starts the local daemon. If any step
-fails, it restores the cloud config and restarts tgmessage there. `off` does
-the reverse and logs the bot out of the local server first.
+That one command:
 
-Downloads are written in 256 KiB chunks and handled by **one ordered worker**
-(one file at a time), so large files do not exhaust RAM or saturate a low-end
-CPU. The local server also runs at lower CPU/IO priority. `/status` shows
-queued and active transfers with their ids; `/cancel_upload <id>` cancels
-either one.
+- stores the API credentials in `.env` with mode `600`
+- installs and starts `/etc/systemd/system/telegram-bot-api.service`
+- binds the server only to `127.0.0.1` on `TG_LOCAL_API_PORT` (8081 by
+  default), with lower CPU/IO priority
+- stops tgmessage, logs the bot out of the cloud Bot API (Telegram's required
+  handoff), and restarts tgmessage in local mode
+- automatically restores the cloud configuration if the switch fails
+
+`tgmessage local-api off` logs out of the local server first, then switches
+back to the cloud API.
+
+### Configuration
+
+Normally `tgmessage local-api` manages these; they are listed so you can tune
+the server or recover a manual setup. The local-mode values go in `.env`:
+
+| key | default | meaning |
+|---|---|---|
+| `TG_API_ROOT` | empty (cloud) | `http://127.0.0.1:8081` for local mode |
+| `TG_API_ID` | empty | Telegram app id from my.telegram.org |
+| `TG_API_HASH` | empty | Telegram app hash; keep it secret |
+| `TG_LOCAL_API_PORT` | `8081` | port the local server listens on; must match `TG_API_ROOT` |
+| `TG_LOCAL_API_DIR` | `/var/lib/telegram-bot-api` | local server storage; needs room for large files |
+| `TG_MAX_DOWNLOAD_MB` | `20` cloud / `2000` local | maximum size per downloaded file |
+| `TG_MAX_UPLOAD_MB` | `50` cloud / `2000` local | maximum size per uploaded file |
+
+Example `.env` for local mode:
+
+```ini
+TG_API_ROOT=http://127.0.0.1:8081
+TG_API_ID=12345678
+TG_API_HASH=0123456789abcdef0123456789abcdef
+TG_LOCAL_API_PORT=8081
+TG_LOCAL_API_DIR=/var/lib/telegram-bot-api
+TG_MAX_DOWNLOAD_MB=2000
+TG_MAX_UPLOAD_MB=2000
+```
+
+If you change `TG_LOCAL_API_PORT`, also update `TG_API_ROOT` and restart both
+services. Put `TG_LOCAL_API_DIR` on a disk with enough free space **before**
+enabling local mode; the local server stores its download there and tgmessage
+hardlinks it into `files/` when both paths are on the same filesystem (it
+falls back to a chunked copy otherwise).
+
+Inspect the generated unit with `systemctl cat telegram-bot-api` and follow its
+log with `journalctl -u telegram-bot-api -f`.
+
+Downloads are handled by **one ordered worker** (one file at a time) in
+256 KiB chunks, so large files do not exhaust RAM or saturate a low-end CPU.
+`/status` shows queued and active transfers with their ids.
+`/cancel_upload <id>` cancels either one.
 
 ## Terminal commands
 
@@ -189,7 +233,7 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
 
 ```
 /root/tgmessage/
-    .env                 token, permissions, watched services, host, port
+    .env                 token, permissions, watched services, bot API settings
     tgmessage            shell wrapper (symlinked to /usr/local/bin)
     tgmessage.py         daemon, UI, /status + /logs, allow/service commands
     tgmessage.service.in systemd unit template
@@ -207,7 +251,7 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
         <chatid>.jsonl     one history file per allowed chat
         pending.json       chats waiting to be allowed
         chats.json         chat metadata
-        offset.json        Telegram update offset
+        offset.json        update offset per Bot API server (cloud/local)
         daemon.log         daemon log (also: journalctl -u tgmessage)
 ```
 
@@ -216,8 +260,10 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
 ```
 TG_BOT_TOKEN=...
 TG_API_ROOT=                # empty = cloud; local: http://127.0.0.1:8081
-TG_API_ID=                  # local Bot API credentials (my.telegram.org)
-TG_API_HASH=
+TG_API_ID=                  # local Bot API app credentials (my.telegram.org)
+TG_API_HASH=                # keep this secret
+TG_LOCAL_API_PORT=8081      # local server port (must match TG_API_ROOT)
+TG_LOCAL_API_DIR=/var/lib/telegram-bot-api  # local server file store
 TG_MAX_DOWNLOAD_MB=         # empty = 20 cloud / 2000 local
 TG_MAX_UPLOAD_MB=           # empty = 50 cloud / 2000 local
 TG_ALLOWED_CHAT_IDS=...     # chat access
