@@ -3332,27 +3332,25 @@ def cmd_local_api(cfg, colours, rest):
         print("! run this command with sudo (it writes .env and systemd units)", file=sys.stderr)
         return 2
 
-    if action in ("off", "disable", "cloud"):
+    if action in ("off", "disable", "cloud", "stop", "down"):
         if cfg.is_local_api:
             service_stop(cfg)
             if not local_api_logout(cfg, "the local Bot API server"):
                 print("! warning: could not log out from the local server", file=sys.stderr)
         local_api_disable_service()
-        write_env(cfg.home, {
-            "TG_API_ROOT": "",
-            "TG_MAX_DOWNLOAD_MB": None,
-            "TG_MAX_UPLOAD_MB": None,
-        })
+        try:
+            write_env(cfg.home, {
+                "TG_API_ROOT": "",
+                "TG_MAX_DOWNLOAD_MB": None,
+                "TG_MAX_UPLOAD_MB": None,
+            })
+        except OSError as exc:
+            print(f"! cannot update {env_file(cfg.home)}: {exc}", file=sys.stderr)
+            return 1
         print("local Bot API disabled - using Telegram cloud (20 MB downloads)")
         cloud_cfg = Config(cfg.home)
         if unit_installed() or daemon_pid(cloud_cfg):
             print(f"daemon restarted ({service_restart(cloud_cfg)})")
-        return 0
-
-    if action in ("stop", "down"):
-        if has_systemd() and os.path.exists(LOCAL_API_UNIT):
-            systemctl("stop", f"{LOCAL_API_SERVICE}.service")
-        print(f"{LOCAL_API_SERVICE}.service: stopped")
         return 0
 
     api_id, api_hash = "", ""
