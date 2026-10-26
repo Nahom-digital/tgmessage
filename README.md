@@ -56,7 +56,7 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 
 | command | does |
 |---|---|
-| `/status` | server report: queued/active transfers with ids + %, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
+| `/status` | server report: queued/active transfers with ids, %, downloaded/total size, speed, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
 | `/cancel_upload <id>` | stop a queued/active transfer shown in `/status` and remove its partial file |
 | `/help` (`/start`) | list the commands |
@@ -154,7 +154,10 @@ log with `journalctl -u telegram-bot-api -f`.
 
 Downloads are handled by **one ordered worker** (one file at a time) in
 256 KiB chunks, so large files do not exhaust RAM or saturate a low-end CPU.
-`/status` shows queued and active transfers with their ids.
+`/status` shows queued and active transfers with their ids, percent, downloaded
+and total size, and current speed. While the local Bot API is fetching a large
+file, tgmessage reads the server's growing temp file so the percentage and
+speed update before `getFile` returns.
 `/cancel_upload <id>` cancels either one.
 
 ## Terminal commands

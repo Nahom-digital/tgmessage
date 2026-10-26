@@ -105,6 +105,7 @@ LOCAL_API_REPO = "https://github.com/tdlib/telegram-bot-api"
 LOCAL_API_SRC = "/opt/telegram-bot-api"
 SERVICE_NAME = "tgmessage"
 MAX_FILE = 50 * 1024 * 1024  # Telegram cloud Bot API limit for uploads
+LOCAL_GETFILE_TIMEOUT = 6 * 60 * 60  # local server may spend hours fetching a file
 
 
 def api_root(cfg):
@@ -622,7 +623,9 @@ class Telegram:
 
     def get_file(self, file_id):
         """Ask Telegram for the server path of a file (getFile)."""
-        timeout = 300 if getattr(self.cfg, "is_local_api", False) else 30
+        # A local server blocks getFile until it has fetched the whole file.
+        # Large files on a slow link can take much longer than the old 5 min.
+        timeout = LOCAL_GETFILE_TIMEOUT if getattr(self.cfg, "is_local_api", False) else 30
         return self.call("getFile", {"file_id": file_id}, timeout=timeout)
 
     @staticmethod
@@ -959,13 +962,16 @@ def start_download(name, chat_id=None, total=None):
     with _active_downloads_lock:
         _active_download_seq += 1
         key = _active_download_seq
+        now = time.time()
         _active_downloads[key] = {
             "id": key,
             "name": name,
             "chat_id": chat_id,
             "done": 0,
             "total": int(total or 0),
-            "started": time.time(),
+            "started": now,
+            "updated": now,
+            "speed": 0.0,
             "state": "queued",
             "cancelled": False,
         }
@@ -978,18 +984,35 @@ def begin_download(key):
         rec = _active_downloads.get(key)
         if rec is None:
             return
+        now = time.time()
         rec["state"] = "downloading"
-        rec["started"] = time.time()
+        rec["started"] = now
+        rec["updated"] = now
+        rec["speed"] = 0.0
 
 
 def update_download(key, done, total=None):
+    """Update progress. done=None only fills in a newly learned total size."""
     with _active_downloads_lock:
         rec = _active_downloads.get(key)
         if rec is None:
             return
-        rec["done"] = max(0, int(done))
+        now = time.time()
+        prev_done = int(rec.get("done") or 0)
+        prev_time = float(rec.get("updated") or rec.get("started") or now)
+        if done is not None:
+            rec["done"] = max(0, int(done))
         if total:
             rec["total"] = int(total)
+        if done is None:
+            return
+        dt = now - prev_time
+        if dt >= 0.05:
+            instant = max(0.0, (rec["done"] - prev_done) / dt)
+            old = float(rec.get("speed") or 0.0)
+            # Smooth bursts from TDLib's temp file and from HTTP chunks.
+            rec["speed"] = instant if old <= 0 else old * 0.6 + instant * 0.4
+            rec["updated"] = now
 
 
 def finish_download(key):
@@ -1025,6 +1048,61 @@ def active_downloads():
         return [dict(rec) for rec in _active_downloads.values()]
 
 
+def local_api_temp_dir(cfg):
+    """The local Bot API server's per-bot temp directory, if it can be found."""
+    token = getattr(cfg, "token", "") or ""
+    if not token:
+        return None
+    return os.path.join(cfg.local_api_dir, token, "temp")
+
+
+def _local_temp_sizes(cfg):
+    sizes = {}
+    temp_dir = local_api_temp_dir(cfg)
+    if not temp_dir:
+        return sizes
+    try:
+        with os.scandir(temp_dir) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        sizes[entry.path] = entry.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return sizes
+
+
+def _monitor_local_download(cfg, key, total, baseline, stop):
+    """Watch the local server's temp file while getFile() is blocking.
+
+    The local Bot API fetches the whole file before getFile returns, so the
+    normal download progress callback only starts afterwards. Reading the
+    growing temp file gives /status real bytes and speed during that wait.
+    """
+    active = None
+    while not stop.wait(0.75):
+        sizes = _local_temp_sizes(cfg)
+        if active is not None:
+            if active in sizes:
+                update_download(key, sizes[active], total)
+                continue
+            active = None
+        candidates = []
+        for path, size in sizes.items():
+            old = baseline.get(path)
+            if old is not None and size <= old:
+                continue
+            if total and size > total:
+                continue
+            candidates.append((size, path))
+        if not candidates:
+            continue
+        active = max(candidates)[1]
+        update_download(key, sizes[active], total)
+
+
 def downloads_status_lines():
     """Lines for /status describing active downloads ([] when idle)."""
     downloads = active_downloads()
@@ -1033,16 +1111,31 @@ def downloads_status_lines():
     lines = [
         f"downloads: {len(downloads)} queued/active (cancel with /cancel_upload <id>)"
     ]
+    now = time.time()
     for rec in downloads:
         done = rec.get("done") or 0
         total = rec.get("total") or 0
+        speed = float(rec.get("speed") or 0.0)
+        updated = float(rec.get("updated") or rec.get("started") or 0.0)
+        if speed and now - updated > 5:
+            speed = 0.0
         if rec.get("state") == "queued":
             detail = "queued"
+            if total:
+                detail += f" | {human_size(total)}"
         elif total:
             pct = max(0, min(100, int(done * 100 / total)))
-            detail = f"{pct}% ({human_size(done)} / {human_size(total)})"
+            detail = f"{pct}% | {human_size(done)} of {human_size(total)}"
+            detail += f" | {human_size(speed)}/s"
+            if done == 0 and now - float(rec.get("started") or now) > 5:
+                detail += " | contacting server"
         else:
-            detail = f"{human_size(done)} (size unknown)"
+            detail = f"{human_size(done)} downloaded"
+            detail += f" | {human_size(speed)}/s"
+            if done == 0 and now - float(rec.get("started") or now) > 5:
+                detail += " | contacting server"
+        if rec.get("cancelled"):
+            detail += " | cancelling"
         lines.append(f"  #{rec.get('id')} {rec.get('name') or 'file'}: {detail}")
     return lines
 
@@ -2000,10 +2093,16 @@ class Daemon:
             done = rec.get("done") or 0
             total = rec.get("total") or 0
             if total:
-                detail = f"{human_size(done)} / {human_size(total)} received"
+                detail = f"{human_size(done)} / {human_size(total)} downloaded"
             else:
-                detail = f"{human_size(done)} received"
-            text = f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} ({detail})"
+                detail = f"{human_size(done)} downloaded"
+            if getattr(self.cfg, "is_local_api", False):
+                text = (
+                    f"cancel requested for #{upload_id}: {rec.get('name') or 'file'} "
+                    f"({detail}). The local server may finish its current fetch first."
+                )
+            else:
+                text = f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} ({detail})"
         self._record_out(cid, text)
 
     def _chat_help_reply(self, cid):
@@ -2067,17 +2166,30 @@ class Daemon:
                 log(self.cfg, note)
                 self._record_out(cid, note)
                 return
+            monitor_stop = None
             try:
                 if download_cancelled(key):
                     raise DownloadCancelled()
-                meta = self.tg.get_file(file_id)
+                if getattr(self.cfg, "is_local_api", False):
+                    baseline = _local_temp_sizes(self.cfg)
+                    monitor_stop = threading.Event()
+                    threading.Thread(
+                        target=_monitor_local_download,
+                        args=(self.cfg, key, size or 0, baseline, monitor_stop),
+                        daemon=True,
+                    ).start()
+                try:
+                    meta = self.tg.get_file(file_id)
+                finally:
+                    if monitor_stop is not None:
+                        monitor_stop.set()
                 server_path = (meta or {}).get("file_path")
                 if not server_path:
                     raise TelegramError("getFile returned no file_path")
                 if not size:
                     size = (meta or {}).get("file_size")
                     if size:
-                        update_download(key, 0, size)
+                        update_download(key, None, size)
                 dest = unique_path(dest_dir, name)
                 self.tg.download_file(
                     server_path,
