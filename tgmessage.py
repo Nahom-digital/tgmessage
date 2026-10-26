@@ -3382,9 +3382,14 @@ def _local_api_install_deps(log_fh):
         return False
     cmd = ["apt-get", "install", "-y"] + missing
     rc = _run_stream(cmd, log_fh)
+    if rc == 130:
+        return False
     if rc != 0:
         print("! apt-get failed; refreshing package lists and retrying ...", file=sys.stderr)
-        if _run_stream(["apt-get", "update"], log_fh) == 0:
+        rc = _run_stream(["apt-get", "update"], log_fh)
+        if rc == 130:
+            return False
+        if rc == 0:
             rc = _run_stream(cmd, log_fh)
     if rc != 0:
         print(
@@ -3419,7 +3424,11 @@ def _local_api_source(cfg, log_fh):
         log_fh,
     )
     if rc != 0 or not os.path.isfile(os.path.join(src, "CMakeLists.txt")):
-        print("! source clone failed; see the build log", file=sys.stderr)
+        if rc == 130:
+            print("! source clone interrupted; rerun the command to retry", file=sys.stderr)
+        else:
+            print("! source clone failed; see the build log", file=sys.stderr)
+        shutil.rmtree(src, ignore_errors=True)
         return None
     return src
 
