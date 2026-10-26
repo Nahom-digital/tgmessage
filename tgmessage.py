@@ -1587,17 +1587,55 @@ class Daemon:
         self.download_queue = queue.Queue()
 
     # ---- state -------------------------------------------------------
-    def _load_offset(self):
+    def _offset_key(self):
+        """Update ids are scoped to one Bot API server."""
+        if not getattr(self.cfg, "is_local_api", False):
+            return "cloud"
+        return self.cfg.api_root or "local"
+
+    def _read_offset_data(self):
         try:
             with open(self.offset_path, encoding="utf-8") as fh:
-                return int(json.load(fh).get("offset", 0))
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
         except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def _load_offset(self):
+        data = self._read_offset_data()
+        key = self._offset_key()
+        offsets = data.get("offsets")
+        if isinstance(offsets, dict):
+            try:
+                return max(0, int(offsets.get(key, 0)))
+            except (TypeError, ValueError):
+                return 0
+        # Old single-server file (all previous releases were cloud-only).
+        try:
+            legacy = int(data.get("offset", 0))
+        except (TypeError, ValueError):
             return 0
+        try:
+            tmp = self.offset_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"offsets": {"cloud": legacy}}, fh)
+            os.replace(tmp, self.offset_path)
+        except OSError:
+            pass
+        return legacy if key == "cloud" else 0
 
     def _save_offset(self):
+        key = self._offset_key()
+        data = self._read_offset_data()
+        offsets = data.get("offsets")
+        if not isinstance(offsets, dict):
+            offsets = {}
+        offsets[key] = max(0, int(self.offset))
         try:
-            with open(self.offset_path, "w", encoding="utf-8") as fh:
-                json.dump({"offset": self.offset}, fh)
+            tmp = self.offset_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"offsets": offsets}, fh)
+            os.replace(tmp, self.offset_path)
         except OSError:
             pass
 
