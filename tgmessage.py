@@ -954,6 +954,8 @@ def message_text(msg):
 _active_downloads = {}
 _active_downloads_lock = threading.Lock()
 _active_download_seq = 0
+_cancel_lock = threading.Lock()
+_local_api_restarting = threading.Event()
 
 
 def start_download(name, chat_id=None, total=None):
@@ -1002,7 +1004,8 @@ def update_download(key, done, total=None):
         prev_done = int(rec.get("done") or 0)
         prev_time = float(rec.get("updated") or rec.get("started") or now)
         if done is not None:
-            rec["done"] = max(0, int(done))
+            new_done = max(0, int(done))
+            rec["done"] = max(int(rec.get("done") or 0), new_done)
         if total:
             rec["total"] = int(total)
         if done is None:
@@ -2095,38 +2098,56 @@ class Daemon:
                 "Use /status to see active uploads and their ids, e.g. /cancel_upload 21",
             )
             return
-        log(self.cfg, f"/cancel_upload {upload_id} requested by chat {cid}")
-        rec = cancel_download(upload_id)
-        if rec is None:
-            text = f"no active upload with id {upload_id} - use /status to list them"
-        elif rec.get("state") == "queued":
-            text = f"cancelled queued upload #{upload_id}: {rec.get('name') or 'file'}"
-        else:
-            done = rec.get("done") or 0
-            total = rec.get("total") or 0
-            if total:
-                detail = f"{human_size(done)} / {human_size(total)} downloaded"
+        with _cancel_lock:
+            local = getattr(self.cfg, "is_local_api", False)
+            paused = False
+            if local:
+                # Stop the worker from starting its next file while the local
+                # server is restarting.  This also closes the race where a
+                # finished transfer is cancelled just as the next one starts.
+                _local_api_restarting.set()
+                paused = True
+            log(self.cfg, f"/cancel_upload {upload_id} requested by chat {cid}")
+            rec = cancel_download(upload_id)
+            if rec is None:
+                if paused:
+                    _local_api_restarting.clear()
+                text = f"no active upload with id {upload_id} - use /status to list them"
+            elif rec.get("state") == "queued":
+                if paused:
+                    _local_api_restarting.clear()
+                text = f"cancelled queued upload #{upload_id}: {rec.get('name') or 'file'}"
             else:
-                detail = f"{human_size(done)} downloaded"
-            if getattr(self.cfg, "is_local_api", False):
-                # The local server keeps fetching after our HTTP request is
-                # cancelled.  A restart is the only way to abort that fetch.
-                log(self.cfg, f"stopping local Bot API fetch for #{upload_id}")
-                stopped, err = local_api_stop_fetches(self.cfg)
-                if stopped:
-                    remove_local_temp(self.cfg, rec.get("temp_path"))
-                    finish_download(upload_id)
-                    text = (
-                        f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} "
-                        f"({detail}). Stopped the local server fetch."
-                    )
+                done = rec.get("done") or 0
+                total = rec.get("total") or 0
+                if total:
+                    detail = f"{human_size(done)} / {human_size(total)} downloaded"
                 else:
-                    text = (
-                        f"cancel requested for #{upload_id}: {rec.get('name') or 'file'} "
-                        f"({detail}), but could not stop the local server: {err}"
-                    )
-            else:
-                text = f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} ({detail})"
+                    detail = f"{human_size(done)} downloaded"
+                if local:
+                    # The local server keeps fetching after our HTTP request is
+                    # cancelled.  A restart is the only way to abort that fetch.
+                    log(self.cfg, f"stopping local Bot API fetch for #{upload_id}")
+                    try:
+                        stopped, err = local_api_stop_fetches(self.cfg)
+                        if stopped:
+                            # Keep the queue paused until the old temp file is
+                            # gone; the next file must not reuse that path.
+                            remove_local_temp(self.cfg, rec.get("temp_path"))
+                            finish_download(upload_id)
+                            text = (
+                                f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} "
+                                f"({detail}). Stopped the local server fetch."
+                            )
+                        else:
+                            text = (
+                                f"cancel requested for #{upload_id}: {rec.get('name') or 'file'} "
+                                f"({detail}), but could not stop the local server: {err}"
+                            )
+                    finally:
+                        _local_api_restarting.clear()
+                else:
+                    text = f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} ({detail})"
         self._record_out(cid, text)
 
     def _chat_help_reply(self, cid):
@@ -2155,6 +2176,11 @@ class Daemon:
                 item = self.download_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+            # A cancel restarts the local server; do not start the next file
+            # until that restart has finished.
+            if getattr(self.cfg, "is_local_api", False):
+                while self.running and _local_api_restarting.is_set():
+                    time.sleep(0.2)
             try:
                 self._save_media(*item)
             except Exception as exc:  # noqa: BLE001 - one file must not kill the queue
@@ -2214,6 +2240,10 @@ class Daemon:
                     size = (meta or {}).get("file_size")
                     if size:
                         update_download(key, None, size)
+                if getattr(self.cfg, "is_local_api", False) and size:
+                    # getFile returned, so the local server has the whole file.
+                    # The remaining work is only a local link/copy.
+                    update_download(key, size, size)
                 dest = unique_path(dest_dir, name)
                 self.tg.download_file(
                     server_path,
@@ -3803,7 +3833,12 @@ def local_api_wait_ready(cfg, timeout=15):
 
 
 def local_api_stop_fetches(cfg):
-    """Stop the local server's in-flight fetch by restarting it."""
+    """Stop the local server's in-flight fetch by restarting it.
+
+    Leaves the download queue paused; the caller must clear
+    _local_api_restarting after it has also removed the old temp file.
+    """
+    _local_api_restarting.set()
     ok, err = local_api_restart_service()
     if not ok:
         return False, err
