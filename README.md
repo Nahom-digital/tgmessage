@@ -50,7 +50,7 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 
 | command | does |
 |---|---|
-| `/status` | server report: watched services, CPU, temp, fan, RAM, disk, battery, IPs |
+| `/status` | server report: active downloads (name + %), watched services, CPU, temp, fan, RAM, disk, battery, IPs |
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
