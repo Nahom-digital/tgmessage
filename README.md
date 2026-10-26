@@ -90,11 +90,16 @@ sudo tgmessage local-api off        # go back to the cloud API
 ```
 
 The command stores `TG_API_ID` / `TG_API_HASH` in `.env` (mode 600), installs
-`telegram-bot-api.service`, points tgmessage at `http://127.0.0.1:8081`, and
-restarts the daemon. Downloads are written in 256 KiB chunks and handled by
-**one ordered worker** (one file at a time), so large files do not exhaust RAM
-or saturate a low-end CPU. `/status` shows queued and active transfers with
-their ids; `/cancel_upload <id>` cancels either one.
+`telegram-bot-api.service`, stops tgmessage, logs the bot out of the cloud Bot
+API (the required Telegram handoff), and starts the local daemon. If any step
+fails, it restores the cloud config and restarts tgmessage there. `off` does
+the reverse and logs the bot out of the local server first.
+
+Downloads are written in 256 KiB chunks and handled by **one ordered worker**
+(one file at a time), so large files do not exhaust RAM or saturate a low-end
+CPU. The local server also runs at lower CPU/IO priority. `/status` shows
+queued and active transfers with their ids; `/cancel_upload <id>` cancels
+either one.
 
 ## Terminal commands
 
