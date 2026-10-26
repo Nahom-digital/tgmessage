@@ -554,8 +554,12 @@ class Telegram:
         """Ask Telegram for the server path of a file (getFile)."""
         return self.call("getFile", {"file_id": file_id}, timeout=30)
 
-    def download_file(self, server_path, dest_path):
-        """Download a file from Telegram's servers to dest_path (stdlib only)."""
+    def download_file(self, server_path, dest_path, progress=None):
+        """Download a file from Telegram's servers to dest_path (stdlib only).
+
+        progress(done, total), when given, is called after every 64 KiB chunk.
+        total is 0 when the server does not report a Content-Length.
+        """
         if not self.cfg.token:
             raise TelegramError("no bot token configured yet")
         url = "https://api.telegram.org/file/bot{token}/{path}".format(
@@ -564,7 +568,22 @@ class Telegram:
         try:
             with urllib.request.urlopen(req, timeout=300) as resp, \
                     open(dest_path, "wb") as out:
-                shutil.copyfileobj(resp, out, 64 * 1024)
+                try:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+                done = 0
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        try:
+                            progress(done, total)
+                        except Exception:  # noqa: BLE001 - never abort a download
+                            pass
         except urllib.error.HTTPError as exc:
             raise TelegramError(f"download failed: HTTP {exc.code}") from None
         except urllib.error.URLError as exc:
@@ -802,6 +821,66 @@ def message_text(msg):
 # --------------------------------------------------------------------------
 # live system status for the /status chat command
 # --------------------------------------------------------------------------
+
+_active_downloads = {}
+_active_downloads_lock = threading.Lock()
+_active_download_seq = 0
+
+
+def start_download(name, chat_id=None, total=None):
+    """Register a transfer so /status can report it while it runs."""
+    global _active_download_seq
+    with _active_downloads_lock:
+        _active_download_seq += 1
+        key = _active_download_seq
+        _active_downloads[key] = {
+            "name": name,
+            "chat_id": chat_id,
+            "done": 0,
+            "total": int(total or 0),
+            "started": time.time(),
+        }
+    return key
+
+
+def update_download(key, done, total=None):
+    with _active_downloads_lock:
+        rec = _active_downloads.get(key)
+        if rec is None:
+            return
+        rec["done"] = max(0, int(done))
+        if total:
+            rec["total"] = int(total)
+
+
+def finish_download(key):
+    with _active_downloads_lock:
+        _active_downloads.pop(key, None)
+
+
+def active_downloads():
+    """Snapshot of transfers still in progress, oldest first."""
+    with _active_downloads_lock:
+        return [dict(rec) for rec in _active_downloads.values()]
+
+
+def downloads_status_lines():
+    """Lines for /status describing active downloads ([] when idle)."""
+    downloads = active_downloads()
+    if not downloads:
+        return []
+    lines = [f"downloads: {len(downloads)} active"]
+    for rec in downloads:
+        done = rec.get("done") or 0
+        total = rec.get("total") or 0
+        if total:
+            pct = max(0, min(100, int(done * 100 / total)))
+            detail = f"{pct}% ({human_size(done)} / {human_size(total)})"
+        else:
+            detail = f"{human_size(done)} (size unknown)"
+        lines.append(f"  {rec.get('name') or 'file'}: {detail}")
+    return lines
+
 
 def _read_int(path):
     try:
@@ -1111,6 +1190,11 @@ def system_status_text(cfg):
         pass
     lines.append(line)
 
+    download_lines = downloads_status_lines()
+    if download_lines:
+        lines.append("")
+        lines.extend(download_lines)
+
     services = status_services(cfg.watch_services)
     lines.append("")
     if not services:
@@ -1285,8 +1369,8 @@ def chat_help_text(cfg, is_sys=False):
     ]
     if is_sys:
         lines += [
-            "/status - live server report: configured services, CPU load + temperature,",
-            "          fan speed, RAM, disk, battery, private + public IP",
+            "/status - live server report: active file downloads, configured services,",
+            "          CPU load + temperature, fan speed, RAM, disk, battery, IPs",
             "/logs   - last 40 lines of the watcher system log (/logs 100 for more)",
         ]
     else:
@@ -1690,18 +1774,29 @@ class Daemon:
             log(self.cfg, note)
             self._record_out(cid, note)
             return
+        key = start_download(name, cid, size)
         try:
             meta = self.tg.get_file(file_id)
             server_path = (meta or {}).get("file_path")
             if not server_path:
                 raise TelegramError("getFile returned no file_path")
+            if not size:
+                size = (meta or {}).get("file_size")
+                if size:
+                    update_download(key, 0, size)
             dest = unique_path(dest_dir, name)
-            self.tg.download_file(server_path, dest)
+            self.tg.download_file(
+                server_path,
+                dest,
+                progress=lambda done, total: update_download(key, done, total),
+            )
         except (TelegramError, OSError) as exc:
             note = f"not saved: {name} ({exc})"
             log(self.cfg, note)
             self._record_out(cid, note)
             return
+        finally:
+            finish_download(key)
         saved = os.path.getsize(dest)
         log(self.cfg, f"saved {kind} {name} ({human_size(saved)}) -> {dest}")
         self._record_out(cid, f"saved: {dest} ({human_size(saved)})")
