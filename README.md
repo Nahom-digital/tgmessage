@@ -70,18 +70,6 @@ API server removes that download cap (uploads up to 2 GB are supported too).
 It runs beside tgmessage on the same machine and stores incoming files in
 `TG_LOCAL_API_DIR`, so tgmessage can read them directly from disk.
 
-### Build the server once
-
-```bash
-sudo apt-get install -y cmake g++ gperf libssl-dev zlib1g-dev
-git clone --recursive https://github.com/tdlib/telegram-bot-api /opt/telegram-bot-api
-cmake -S /opt/telegram-bot-api -B /opt/telegram-bot-api/build \
-      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-sudo nice -n 19 cmake --build /opt/telegram-bot-api/build --target install -- -j1
-```
-
-`-j1` + `nice` keeps the one-time build from saturating a low-end CPU.
-
 ### Enable it
 
 Create an app at [my.telegram.org](https://my.telegram.org)
@@ -93,15 +81,33 @@ tgmessage local-api status          # binary, service, API root, size limits
 sudo tgmessage local-api off        # go back to the cloud API
 ```
 
-That one command:
+If `/usr/local/bin/telegram-bot-api` is missing, the command **builds and
+installs it automatically** and shows live progress (`[ 10%] ...`). It installs
+the build dependencies, clones the official source to `TG_LOCAL_API_SRC`, and
+builds with `TG_LOCAL_API_JOBS` (default `1`) at low CPU/IO priority. The bot
+stays online on the cloud API during the build, and the full output is kept in
+`state/local-api-build.log`.
+
+That command:
 
 - stores the API credentials in `.env` with mode `600`
+- builds the server if needed, showing live progress
 - installs and starts `/etc/systemd/system/telegram-bot-api.service`
 - binds the server only to `127.0.0.1` on `TG_LOCAL_API_PORT` (8081 by
   default), with lower CPU/IO priority
 - stops tgmessage, logs the bot out of the cloud Bot API (Telegram's required
   handoff), and restarts tgmessage in local mode
 - automatically restores the cloud configuration if the switch fails
+
+If you prefer to build the server yourself:
+
+```bash
+sudo apt-get install -y cmake g++ gperf libssl-dev zlib1g-dev
+git clone --recursive https://github.com/tdlib/telegram-bot-api /opt/telegram-bot-api
+cmake -S /opt/telegram-bot-api -B /opt/telegram-bot-api/build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+sudo nice -n 19 cmake --build /opt/telegram-bot-api/build --target install -- -j1
+```
 
 `tgmessage local-api off` logs out of the local server first, then switches
 back to the cloud API.
@@ -118,6 +124,8 @@ the server or recover a manual setup. The local-mode values go in `.env`:
 | `TG_API_HASH` | empty | Telegram app hash; keep it secret |
 | `TG_LOCAL_API_PORT` | `8081` | port the local server listens on; must match `TG_API_ROOT` |
 | `TG_LOCAL_API_DIR` | `/var/lib/telegram-bot-api` | local server storage; needs room for large files |
+| `TG_LOCAL_API_SRC` | `/opt/telegram-bot-api` | source dir; cloned there automatically if missing |
+| `TG_LOCAL_API_JOBS` | `1` | build jobs; keep `1` on a low-end machine |
 | `TG_MAX_DOWNLOAD_MB` | `20` cloud / `2000` local | maximum size per downloaded file |
 | `TG_MAX_UPLOAD_MB` | `50` cloud / `2000` local | maximum size per uploaded file |
 
@@ -129,6 +137,8 @@ TG_API_ID=12345678
 TG_API_HASH=0123456789abcdef0123456789abcdef
 TG_LOCAL_API_PORT=8081
 TG_LOCAL_API_DIR=/var/lib/telegram-bot-api
+TG_LOCAL_API_SRC=/opt/telegram-bot-api
+TG_LOCAL_API_JOBS=1
 TG_MAX_DOWNLOAD_MB=2000
 TG_MAX_UPLOAD_MB=2000
 ```
@@ -264,6 +274,8 @@ TG_API_ID=                  # local Bot API app credentials (my.telegram.org)
 TG_API_HASH=                # keep this secret
 TG_LOCAL_API_PORT=8081      # local server port (must match TG_API_ROOT)
 TG_LOCAL_API_DIR=/var/lib/telegram-bot-api  # local server file store
+TG_LOCAL_API_SRC=/opt/telegram-bot-api      # source; auto-cloned if missing
+TG_LOCAL_API_JOBS=1         # build jobs (1 = low-end friendly)
 TG_MAX_DOWNLOAD_MB=         # empty = 20 cloud / 2000 local
 TG_MAX_UPLOAD_MB=           # empty = 50 cloud / 2000 local
 TG_ALLOWED_CHAT_IDS=...     # chat access

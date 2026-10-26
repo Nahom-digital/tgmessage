@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import getpass
 import json
 import mimetypes
@@ -100,6 +101,8 @@ LOCAL_API_PORT = 8081
 LOCAL_API_SERVICE = "telegram-bot-api"
 LOCAL_API_UNIT = "/etc/systemd/system/telegram-bot-api.service"
 LOCAL_API_BIN = "/usr/local/bin/telegram-bot-api"
+LOCAL_API_REPO = "https://github.com/tdlib/telegram-bot-api"
+LOCAL_API_SRC = "/opt/telegram-bot-api"
 SERVICE_NAME = "tgmessage"
 MAX_FILE = 50 * 1024 * 1024  # Telegram cloud Bot API limit for uploads
 
@@ -243,6 +246,8 @@ ENV_TEMPLATE = [
     ("TG_API_HASH", "", "Telegram api_hash for the local Bot API server"),
     ("TG_LOCAL_API_PORT", "8081", "local Bot API server port"),
     ("TG_LOCAL_API_DIR", "/var/lib/telegram-bot-api", "local Bot API server file storage"),
+    ("TG_LOCAL_API_SRC", LOCAL_API_SRC, "local Bot API source; built automatically if missing"),
+    ("TG_LOCAL_API_JOBS", "1", "build jobs (1 = low-end friendly)"),
     ("TG_MAX_DOWNLOAD_MB", "", "max download size in MB (default: 20 cloud, 2000 local)"),
     ("TG_MAX_UPLOAD_MB", "", "max upload size in MB (default: 50 cloud, 2000 local)"),
     ("TG_ALLOWED_CHAT_IDS", "", "chat ids allowed to talk to this bot"),
@@ -375,6 +380,13 @@ class Config:
         self.local_api_port = int(get("TG_LOCAL_API_PORT", str(LOCAL_API_PORT)) or LOCAL_API_PORT)
         self.local_api_dir = os.path.abspath(os.path.expanduser(
             get("TG_LOCAL_API_DIR") or "/var/lib/telegram-bot-api"))
+        self.local_api_src = os.path.abspath(os.path.expanduser(
+            get("TG_LOCAL_API_SRC") or LOCAL_API_SRC))
+        try:
+            self.local_api_jobs = max(1, min(int(get("TG_LOCAL_API_JOBS", "1") or 1),
+                                            os.cpu_count() or 1))
+        except (TypeError, ValueError):
+            self.local_api_jobs = 1
         self.is_local_api = bool(self.api_root) and "api.telegram.org" not in self.api_root
         default_download_mb = 2000 if self.is_local_api else 20
         default_upload_mb = 2000 if self.is_local_api else 50
@@ -3225,8 +3237,360 @@ def service_restart(cfg):
 # --------------------------------------------------------------------------
 
 
+def local_api_installed():
+    """Path to a usable telegram-bot-api binary, or None."""
+    binary = shutil.which("telegram-bot-api")
+    if binary:
+        return binary
+    if os.path.isfile(LOCAL_API_BIN) and os.access(LOCAL_API_BIN, os.X_OK):
+        return LOCAL_API_BIN
+    return None
+
+
 def local_api_bin():
-    return shutil.which("telegram-bot-api") or LOCAL_API_BIN
+    return local_api_installed() or LOCAL_API_BIN
+
+
+def _print_log_tail(path, count=12):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()[-count:]
+    except OSError:
+        return
+    if not lines:
+        return
+    print("  last build output:", file=sys.stderr)
+    for line in lines:
+        print(f"    {line.rstrip()[:220]}", file=sys.stderr)
+
+
+def _run_stream(cmd, log_fh, title="", progress=False):
+    """Run a command, stream filtered progress, and keep a full log."""
+    if title:
+        print(title, flush=True)
+    try:
+        log_fh.write(f"\n$ {' '.join(shlex.quote(str(x)) for x in cmd)}\n")
+        log_fh.flush()
+    except OSError:
+        pass
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, start_new_session=True,
+        )
+    except OSError as exc:
+        print(f"! cannot run {cmd[0]}: {exc}", file=sys.stderr)
+        return 127
+    started = time.time()
+    last_pct = -1
+    last_shown = 0.0
+    line_q: queue.Queue = queue.Queue()
+
+    def _read_lines():
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line_q.put(line)
+        finally:
+            line_q.put(None)
+
+    threading.Thread(target=_read_lines, daemon=True).start()
+    try:
+        while True:
+            try:
+                raw = line_q.get(timeout=5)
+            except queue.Empty:
+                if progress and time.time() - last_shown >= 30:
+                    print(f"  ... still building ({int(time.time() - started)}s)", flush=True)
+                    last_shown = time.time()
+                continue
+            if raw is None:
+                break
+            try:
+                log_fh.write(raw)
+                log_fh.flush()
+            except OSError:
+                pass
+            line = raw.rstrip("\n")
+            if not progress:
+                if line:
+                    print(line, flush=True)
+                continue
+            pct = None
+            text = ""
+            match = re.match(r"^\[\s*(\d+)%\]\s*(.*)$", line)
+            if match:
+                pct = int(match.group(1))
+                text = match.group(2)
+            else:
+                match = re.match(r"^\[\s*(\d+)/(\d+)\]\s*(.*)$", line)
+                if match:
+                    total = int(match.group(2)) or 1
+                    pct = int(match.group(1)) * 100 // total
+                    text = match.group(3)
+            if pct is not None:
+                now = time.time()
+                if pct != last_pct and (pct >= 100 or pct % 5 == 0 or now - last_shown >= 30):
+                    elapsed = int(now - started)
+                    print(f"  {pct:3d}%  {elapsed:4d}s  {text[:60]}", flush=True)
+                    last_pct = pct
+                    last_shown = now
+            elif "error" in line.lower() or "warning" in line.lower():
+                print(f"  {line[:200]}", flush=True)
+            elif "installing:" in line.lower() or "built target" in line.lower():
+                print(f"  {line[:120]}", flush=True)
+        return proc.wait()
+    except KeyboardInterrupt:
+        print("\n! interrupted; stopping the build ...", file=sys.stderr, flush=True)
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        return 130
+
+
+def _local_api_missing_deps():
+    missing = []
+    for tool, package in (("cmake", "cmake"), ("g++", "g++"),
+                          ("gperf", "gperf"), ("git", "git")):
+        if not shutil.which(tool):
+            missing.append(package)
+    if not os.path.exists("/usr/include/openssl/ssl.h"):
+        missing.append("libssl-dev")
+    if not os.path.exists("/usr/include/zlib.h"):
+        missing.append("zlib1g-dev")
+    return missing
+
+
+def _local_api_install_deps(log_fh):
+    missing = _local_api_missing_deps()
+    if not missing:
+        return True
+    print("Installing build dependencies: " + " ".join(missing), flush=True)
+    if not shutil.which("apt-get"):
+        print("! install these packages first: " + " ".join(missing), file=sys.stderr)
+        return False
+    cmd = ["apt-get", "install", "-y"] + missing
+    rc = _run_stream(cmd, log_fh)
+    if rc != 0:
+        print("! apt-get failed; refreshing package lists and retrying ...", file=sys.stderr)
+        if _run_stream(["apt-get", "update"], log_fh) == 0:
+            rc = _run_stream(cmd, log_fh)
+    if rc != 0:
+        print(
+            "! cannot install build dependencies; run manually:\n"
+            "  sudo apt-get update && sudo apt-get install -y " + " ".join(missing),
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _local_api_source(cfg, log_fh):
+    src = cfg.local_api_src
+    if os.path.isfile(os.path.join(src, "CMakeLists.txt")):
+        return src
+    if os.path.exists(src):
+        print(
+            f"! {src} exists but is not a telegram-bot-api source tree.\n"
+            "  Remove it or set TG_LOCAL_API_SRC to the correct directory.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        os.makedirs(os.path.dirname(src) or ".", exist_ok=True)
+    except OSError as exc:
+        print(f"! cannot create {os.path.dirname(src)}: {exc}", file=sys.stderr)
+        return None
+    print(f"Cloning Telegram Bot API source into {src} ...", flush=True)
+    print("  first run only - this can take a few minutes", flush=True)
+    rc = _run_stream(
+        ["git", "clone", "--recursive", "--progress", LOCAL_API_REPO, src],
+        log_fh,
+    )
+    if rc != 0 or not os.path.isfile(os.path.join(src, "CMakeLists.txt")):
+        print("! source clone failed; see the build log", file=sys.stderr)
+        return None
+    return src
+
+
+def _local_api_build_running():
+    """PID of an existing telegram-bot-api compile, if one is running."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "telegram-bot-api" in cmd and ("cmake --build" in cmd or "gmake" in cmd):
+            return int(entry)
+    return None
+
+
+def _local_api_build_lock(cfg):
+    path = os.path.join(cfg.state_dir, "local-api-build.lock")
+    fd = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
+def _local_api_build_unlock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def local_api_build(cfg, colours):
+    """Build + install telegram-bot-api with visible progress."""
+    if local_api_installed():
+        return True
+    running = _local_api_build_running()
+    if running:
+        print(
+            f"! a Telegram Bot API build is already running (pid {running}).\n"
+            "  Wait for it to finish, then rerun this command.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"! cannot create {cfg.state_dir}: {exc}", file=sys.stderr)
+        return False
+    lock_fd = _local_api_build_lock(cfg)
+    if lock_fd is None:
+        print("! another local Bot API build is already running", file=sys.stderr)
+        return False
+    try:
+        return _local_api_build_inner(cfg, colours)
+    finally:
+        _local_api_build_unlock(lock_fd)
+
+
+def _local_api_build_inner(cfg, colours):
+    """The actual build; the public wrapper holds the process lock."""
+    c = colours
+    if local_api_installed():
+        return True
+    if os.geteuid() != 0:
+        print("! building the local Bot API server needs root - run this with sudo",
+              file=sys.stderr)
+        return False
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"! cannot create {cfg.state_dir}: {exc}", file=sys.stderr)
+        return False
+    log_path = os.path.join(cfg.state_dir, "local-api-build.log")
+    try:
+        log_fh = open(log_path, "a", encoding="utf-8")
+    except OSError as exc:
+        print(f"! cannot write {log_path}: {exc}", file=sys.stderr)
+        return False
+    try:
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass
+    try:
+        try:
+            log_fh.write(
+                f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} local Bot API build =====\n"
+            )
+            log_fh.flush()
+        except OSError:
+            pass
+        print(f"{c['b']}local Bot API server is not installed yet{c['rst']}")
+        print(f"  source   {cfg.local_api_src}")
+        print(f"  jobs     {cfg.local_api_jobs} (nice 19, low IO priority)")
+        print(f"  log      {log_path}")
+        print("  tgmessage stays on the Telegram cloud API while this runs.")
+        if not _local_api_install_deps(log_fh):
+            return False
+        src = _local_api_source(cfg, log_fh)
+        if not src:
+            return False
+        build_dir = os.path.join(src, "build")
+        print("Configuring the build ...", flush=True)
+        rc = _run_stream(
+            [
+                "cmake", "-S", src, "-B", build_dir,
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_INSTALL_PREFIX=/usr/local",
+            ],
+            log_fh,
+        )
+        if rc == 130:
+            print("! configure interrupted; rerun the command to resume", file=sys.stderr)
+            return False
+        if rc != 0:
+            print(f"! configure failed (exit {rc})", file=sys.stderr)
+            _print_log_tail(log_path)
+            return False
+        jobs = max(1, int(getattr(cfg, "local_api_jobs", 1)))
+        print(
+            f"Building and installing ({jobs} job(s); the long part) ...",
+            flush=True,
+        )
+        cmd = [
+            "cmake", "--build", build_dir, "--target", "install", "--", f"-j{jobs}"
+        ]
+        prefix = []
+        if shutil.which("stdbuf"):
+            prefix += ["stdbuf", "-oL", "-eL"]
+        if shutil.which("nice"):
+            prefix += ["nice", "-n", "19"]
+        if shutil.which("ionice"):
+            prefix += ["ionice", "-c3"]
+        rc = _run_stream(prefix + cmd, log_fh, progress=True)
+        if rc == 130:
+            print("! build interrupted; rerun the command to resume", file=sys.stderr)
+            return False
+        if rc != 0:
+            print(f"! build failed (exit {rc})", file=sys.stderr)
+            _print_log_tail(log_path)
+            return False
+        binary = local_api_installed()
+        if not binary:
+            print(
+                f"! build finished but {LOCAL_API_BIN} was not installed",
+                file=sys.stderr,
+            )
+            _print_log_tail(log_path)
+            return False
+        print(f"{c['green']}installed{c['rst']} {binary}")
+        return True
+    except Exception as exc:  # noqa: BLE001 - show a useful failure instead of a traceback
+        print(f"! local Bot API build error: {exc!r}", file=sys.stderr)
+        _print_log_tail(log_path)
+        return False
+    finally:
+        log_fh.close()
 
 
 def local_api_unit_text(cfg):
@@ -3309,14 +3673,11 @@ def local_api_install_service(cfg, colours):
     if not has_systemd():
         print("! systemd is required to run the local Bot API server", file=sys.stderr)
         return False
-    binary = shutil.which("telegram-bot-api")
-    if not binary and os.path.isfile(LOCAL_API_BIN):
-        binary = LOCAL_API_BIN
+    binary = local_api_installed()
     if not binary:
         print(
-            f"! {LOCAL_API_BIN} is not installed yet.\n"
-            "  Build it from https://github.com/tdlib/telegram-bot-api "
-            "or use the installer in the project README.",
+            f"! {LOCAL_API_BIN} is missing.\n"
+            "  Run: sudo tgmessage local-api install",
             file=sys.stderr,
         )
         return False
@@ -3354,14 +3715,16 @@ def cmd_local_api(cfg, colours, rest):
     action = (rest[0].strip().lower() if rest else "")
 
     if action in ("status", "show"):
-        binary = shutil.which("telegram-bot-api")
+        binary = local_api_installed()
         print(f"{c['b']}local Bot API{c['rst']}")
-        print(f"  binary        {binary or LOCAL_API_BIN + ' (MISSING)'}")
+        print(f"  binary        {binary or 'missing - run: sudo tgmessage local-api install'}")
         print(f"  service       {local_api_service_state()}")
         print(f"  api id        {cfg.api_id or '(not set)'}")
         print(f"  api hash      {'***' + cfg.api_hash[-4:] if cfg.api_hash else '(not set)'}")
         print(f"  api root      {cfg.api_root or 'Telegram cloud (default)'}")
         print(f"  storage       {cfg.local_api_dir}")
+        print(f"  source        {cfg.local_api_src}")
+        print(f"  build jobs    {cfg.local_api_jobs}")
         print(f"  downloads     up to {human_size(cfg.max_download)}")
         print(f"  uploads       up to {human_size(cfg.max_upload)}")
         return 0
@@ -3432,6 +3795,14 @@ def cmd_local_api(cfg, colours, rest):
         pass
     cfg.api_id, cfg.api_hash = api_id, api_hash
     print(f"saved api_id {api_id} and api_hash ***{api_hash[-4:]} to {env_file(cfg.home)}")
+
+    # Build before touching the running daemon, so the bot stays online on the
+    # cloud API during the one-time compile. The build streams its progress.
+    if not local_api_installed():
+        if not local_api_build(cfg, colours):
+            print("credentials saved; tgmessage still uses the Telegram cloud API",
+                  file=sys.stderr)
+            return 1
 
     was_local = cfg.is_local_api
     if not was_local:
