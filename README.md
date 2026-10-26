@@ -158,7 +158,10 @@ Downloads are handled by **one ordered worker** (one file at a time) in
 and total size, and current speed. While the local Bot API is fetching a large
 file, tgmessage reads the server's growing temp file so the percentage and
 speed update before `getFile` returns.
-`/cancel_upload <id>` cancels either one.
+`/cancel_upload <id>` cancels either one. Because the local server's `getFile`
+blocks until its fetch finishes, cancelling an active local download briefly
+restarts `telegram-bot-api` to abort that fetch; the bot reconnects
+automatically and the partial temp file is removed.
 
 ## Terminal commands
 

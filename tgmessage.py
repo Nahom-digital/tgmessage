@@ -974,6 +974,7 @@ def start_download(name, chat_id=None, total=None):
             "speed": 0.0,
             "state": "queued",
             "cancelled": False,
+            "temp_path": None,
         }
     return key
 
@@ -1013,6 +1014,16 @@ def update_download(key, done, total=None):
             # Smooth bursts from TDLib's temp file and from HTTP chunks.
             rec["speed"] = instant if old <= 0 else old * 0.6 + instant * 0.4
             rec["updated"] = now
+
+
+def set_download_temp(key, path):
+    """Remember which local-server temp file belongs to this transfer."""
+    if not path:
+        return
+    with _active_downloads_lock:
+        rec = _active_downloads.get(key)
+        if rec is not None:
+            rec["temp_path"] = path
 
 
 def finish_download(key):
@@ -1100,6 +1111,7 @@ def _monitor_local_download(cfg, key, total, baseline, stop):
         if not candidates:
             continue
         active = max(candidates)[1]
+        set_download_temp(key, active)
         update_download(key, sizes[active], total)
 
 
@@ -2097,10 +2109,22 @@ class Daemon:
             else:
                 detail = f"{human_size(done)} downloaded"
             if getattr(self.cfg, "is_local_api", False):
-                text = (
-                    f"cancel requested for #{upload_id}: {rec.get('name') or 'file'} "
-                    f"({detail}). The local server may finish its current fetch first."
-                )
+                # The local server keeps fetching after our HTTP request is
+                # cancelled.  A restart is the only way to abort that fetch.
+                log(self.cfg, f"stopping local Bot API fetch for #{upload_id}")
+                stopped, err = local_api_stop_fetches(self.cfg)
+                if stopped:
+                    remove_local_temp(self.cfg, rec.get("temp_path"))
+                    finish_download(upload_id)
+                    text = (
+                        f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} "
+                        f"({detail}). Stopped the local server fetch."
+                    )
+                else:
+                    text = (
+                        f"cancel requested for #{upload_id}: {rec.get('name') or 'file'} "
+                        f"({detail}), but could not stop the local server: {err}"
+                    )
             else:
                 text = f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} ({detail})"
         self._record_out(cid, text)
@@ -2208,6 +2232,9 @@ class Daemon:
                 log(self.cfg, f"cancelled upload #{key} {name}")
                 return
             except (TelegramError, OSError) as exc:
+                if download_cancelled(key):
+                    log(self.cfg, f"cancelled upload #{key} {name}")
+                    return
                 note = f"not saved: {name} ({exc})"
                 log(self.cfg, note)
                 self._record_out(cid, note)
@@ -3744,6 +3771,61 @@ def local_api_service_state():
         return "not installed"
     state = systemctl("is-active", f"{LOCAL_API_SERVICE}.service").stdout.strip()
     return state or "unknown"
+
+
+def local_api_restart_service():
+    """Restart the local server; this aborts its blocking getFile downloads."""
+    if not has_systemd() or not os.path.exists(LOCAL_API_UNIT):
+        return False, "local Bot API service is not installed"
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", f"{LOCAL_API_SERVICE}.service"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, detail or f"systemctl exited {result.returncode}"
+    return True, ""
+
+
+def local_api_wait_ready(cfg, timeout=15):
+    """Wait until the restarted local server answers getMe again."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if local_api_ping(cfg, timeout=1):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def local_api_stop_fetches(cfg):
+    """Stop the local server's in-flight fetch by restarting it."""
+    ok, err = local_api_restart_service()
+    if not ok:
+        return False, err
+    local_api_wait_ready(cfg)
+    return True, ""
+
+
+def remove_local_temp(cfg, path):
+    """Remove one orphaned file from the local server's temp directory."""
+    if not path:
+        return
+    temp_dir = local_api_temp_dir(cfg)
+    if not temp_dir:
+        return
+    try:
+        temp_dir = os.path.realpath(temp_dir)
+        real = os.path.realpath(path)
+        if os.path.commonpath([temp_dir, real]) != temp_dir:
+            return
+        os.remove(real)
+    except (OSError, ValueError):
+        pass
 
 
 def local_api_ping(cfg, timeout=5):
