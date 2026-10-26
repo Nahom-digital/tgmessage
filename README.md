@@ -22,7 +22,7 @@ sudo ./install.sh --token '123456789:AA...'   # installs bot + watcher
 
 tgmessage requests                # message your bot first; your id shows here
 tgmessage allow <your-chat-id>    # chat access
-tgmessage allow sys <your-id>     # + /status and /logs
+tgmessage allow sys <your-id>     # + /status, /logs and /cancel_upload
 tgmessage allow mang <your-id>    # + watcher reports (recommended for you)
 
 tgmessage service add <unit>      # watch a service (down -> restart + alert)
@@ -38,7 +38,7 @@ opt-in and managed from the CLI (or `/allow` in the UI):
 | command | gives |
 |---|---|
 | `tgmessage allow <id>` | chat, files, history |
-| `tgmessage allow sys <id>` | + `/status` and `/logs` in Telegram |
+| `tgmessage allow sys <id>` | + `/status`, `/logs` and `/cancel_upload` in Telegram |
 | `tgmessage allow mang <id>` | + watcher reports (manage); `mang` implies `sys` |
 
 Revoke with `tgmessage deny [sys\|mang] <id>`; a plain deny removes everything.
@@ -46,12 +46,13 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 
 ## Telegram chat commands
 
-`/help` works for every allowed chat. The first two need `sys` access.
+`/help` works for every allowed chat. The first three need `sys` access.
 
 | command | does |
 |---|---|
-| `/status` | server report: active downloads (name + %), watched services, CPU, temp, fan, RAM, disk, battery, IPs |
+| `/status` | server report: active downloads with ids + %, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
+| `/cancel_upload <id>` | stop an active upload shown in `/status` and remove its partial file |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
 

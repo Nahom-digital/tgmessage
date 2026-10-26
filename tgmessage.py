@@ -22,7 +22,7 @@ A bot can be messaged by many people, but it may only talk to people who are
 allowed. Permission levels are managed in .env by the CLI:
 
     tgmessage allow <id>         chat only (send/receive/files)
-    tgmessage allow sys <id>     + /status and /logs from Telegram
+    tgmessage allow sys <id>     + /status, /logs and /cancel_upload from Telegram
     tgmessage allow mang <id>    + watcher reports (manage)
     tgmessage deny [sys|mang] <id>
     tgmessage service add <unit> watch a systemd service (restart + alert)
@@ -217,7 +217,7 @@ def osc52(text):
 ENV_TEMPLATE = [
     ("TG_BOT_TOKEN", "", "BotFather token, looks like 123456789:AA........"),
     ("TG_ALLOWED_CHAT_IDS", "", "chat ids allowed to talk to this bot"),
-    ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status and /logs (tgmessage allow sys)"),
+    ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status, /logs and /cancel_upload (tgmessage allow sys)"),
     ("TG_MANG_CHAT_IDS", "", "chat ids that receive watcher reports (tgmessage allow mang)"),
     ("TG_WATCH_SERVICES", "", "systemd services watched by the watcher (tgmessage service add)"),
     ("TG_SERVICE_NO_RESTART", "", "watched services the watcher reports but never restarts (tgmessage service <unit> stop)"),
@@ -450,6 +450,10 @@ class TelegramError(Exception):
     pass
 
 
+class DownloadCancelled(Exception):
+    """An in-flight download was stopped by /cancel_upload."""
+
+
 class Telegram:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -554,11 +558,13 @@ class Telegram:
         """Ask Telegram for the server path of a file (getFile)."""
         return self.call("getFile", {"file_id": file_id}, timeout=30)
 
-    def download_file(self, server_path, dest_path, progress=None):
+    def download_file(self, server_path, dest_path, progress=None, cancelled=None):
         """Download a file from Telegram's servers to dest_path (stdlib only).
 
         progress(done, total), when given, is called after every 64 KiB chunk.
         total is 0 when the server does not report a Content-Length.
+        cancelled(), when given, is checked before every chunk; returning True
+        aborts the transfer with DownloadCancelled.
         """
         if not self.cfg.token:
             raise TelegramError("no bot token configured yet")
@@ -574,6 +580,8 @@ class Telegram:
                     total = 0
                 done = 0
                 while True:
+                    if cancelled and cancelled():
+                        raise DownloadCancelled()
                     chunk = resp.read(64 * 1024)
                     if not chunk:
                         break
@@ -834,11 +842,13 @@ def start_download(name, chat_id=None, total=None):
         _active_download_seq += 1
         key = _active_download_seq
         _active_downloads[key] = {
+            "id": key,
             "name": name,
             "chat_id": chat_id,
             "done": 0,
             "total": int(total or 0),
             "started": time.time(),
+            "cancelled": False,
         }
     return key
 
@@ -858,6 +868,23 @@ def finish_download(key):
         _active_downloads.pop(key, None)
 
 
+def cancel_download(key):
+    """Mark a transfer as cancelled. Returns its record, or None if unknown."""
+    with _active_downloads_lock:
+        rec = _active_downloads.get(key)
+        if rec is None:
+            return None
+        rec["cancelled"] = True
+        return dict(rec)
+
+
+def download_cancelled(key):
+    """True once cancel_download(key) was called (or the transfer is gone)."""
+    with _active_downloads_lock:
+        rec = _active_downloads.get(key)
+        return rec is None or bool(rec.get("cancelled"))
+
+
 def active_downloads():
     """Snapshot of transfers still in progress, oldest first."""
     with _active_downloads_lock:
@@ -869,7 +896,9 @@ def downloads_status_lines():
     downloads = active_downloads()
     if not downloads:
         return []
-    lines = [f"downloads: {len(downloads)} active"]
+    lines = [
+        f"downloads: {len(downloads)} active (cancel with /cancel_upload <id>)"
+    ]
     for rec in downloads:
         done = rec.get("done") or 0
         total = rec.get("total") or 0
@@ -878,7 +907,7 @@ def downloads_status_lines():
             detail = f"{pct}% ({human_size(done)} / {human_size(total)})"
         else:
             detail = f"{human_size(done)} (size unknown)"
-        lines.append(f"  {rec.get('name') or 'file'}: {detail}")
+        lines.append(f"  #{rec.get('id')} {rec.get('name') or 'file'}: {detail}")
     return lines
 
 
@@ -1372,10 +1401,11 @@ def chat_help_text(cfg, is_sys=False):
             "/status - live server report: active file downloads, configured services,",
             "          CPU load + temperature, fan speed, RAM, disk, battery, IPs",
             "/logs   - last 40 lines of the watcher system log (/logs 100 for more)",
+            "/cancel_upload <id> - stop an active upload listed by /status",
         ]
     else:
         lines += [
-            "/status and /logs need sys access - ask the bot owner to run:",
+            "/status, /logs and /cancel_upload need sys access - ask the bot owner to run:",
             "  tgmessage allow sys <your-chat-id>",
         ]
     lines += [
@@ -1700,6 +1730,20 @@ class Daemon:
                 except ValueError:
                     pass
             threading.Thread(target=self._chat_logs_reply, args=(cid, n), daemon=True).start()
+        elif head == "/cancel_upload":
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/cancel_upload", "sys"), daemon=True).start()
+                return
+            upload_id = None
+            parts = cmd.split()
+            if len(parts) > 1:
+                try:
+                    upload_id = int(parts[1].lstrip("#"))
+                except ValueError:
+                    upload_id = None
+                if upload_id is not None and upload_id <= 0:
+                    upload_id = None
+            threading.Thread(target=self._chat_cancel_upload_reply, args=(cid, upload_id), daemon=True).start()
         elif head in ("/help", "/start", "/commands"):
             threading.Thread(target=self._chat_help_reply, args=(cid,), daemon=True).start()
 
@@ -1748,6 +1792,28 @@ class Daemon:
             text = f"logs error: {exc!r}"
         self._record_out(cid, text)
 
+    def _chat_cancel_upload_reply(self, cid, upload_id=None):
+        if upload_id is None:
+            self._record_out(
+                cid,
+                "usage: /cancel_upload <id>\n"
+                "Use /status to see active uploads and their ids, e.g. /cancel_upload 21",
+            )
+            return
+        log(self.cfg, f"/cancel_upload {upload_id} requested by chat {cid}")
+        rec = cancel_download(upload_id)
+        if rec is None:
+            text = f"no active upload with id {upload_id} - use /status to list them"
+        else:
+            done = rec.get("done") or 0
+            total = rec.get("total") or 0
+            if total:
+                detail = f"{human_size(done)} / {human_size(total)} received"
+            else:
+                detail = f"{human_size(done)} received"
+            text = f"cancelled upload #{upload_id}: {rec.get('name') or 'file'} ({detail})"
+        self._record_out(cid, text)
+
     def _chat_help_reply(self, cid):
         log(self.cfg, f"/help requested by chat {cid}")
         self._record_out(cid, chat_help_text(self.cfg, is_sys=self.can_sys(cid)))
@@ -1775,7 +1841,10 @@ class Daemon:
             self._record_out(cid, note)
             return
         key = start_download(name, cid, size)
+        dest = None
         try:
+            if download_cancelled(key):
+                raise DownloadCancelled()
             meta = self.tg.get_file(file_id)
             server_path = (meta or {}).get("file_path")
             if not server_path:
@@ -1789,7 +1858,18 @@ class Daemon:
                 server_path,
                 dest,
                 progress=lambda done, total: update_download(key, done, total),
+                cancelled=lambda: download_cancelled(key),
             )
+            if download_cancelled(key):
+                raise DownloadCancelled()
+        except DownloadCancelled:
+            try:
+                if dest:
+                    os.remove(dest)
+            except OSError:
+                pass
+            log(self.cfg, f"cancelled upload #{key} {name}")
+            return
         except (TelegramError, OSError) as exc:
             note = f"not saved: {name} ({exc})"
             log(self.cfg, note)
@@ -2947,7 +3027,7 @@ tgmessage - Telegram from any terminal, one session per chat.
   tgmessage requests, --request  list chats waiting to be allowed
 
   tgmessage allow <id> [...]     allow a chat to talk to the bot
-  tgmessage allow sys <id> ...   + /status and /logs from Telegram
+  tgmessage allow sys <id> ...   + /status, /logs and /cancel_upload from Telegram
   tgmessage allow mang <id> ...  + watcher reports (manage)
   tgmessage deny <id> [...]      revoke everything for a chat
   tgmessage deny sys|mang <id>   revoke only that level
@@ -2972,11 +3052,14 @@ tgmessage - Telegram from any terminal, one session per chat.
 In the UI: /session [n|id] pick a chat, /allow [sys|mang] <id>, /deny <id>,
 /requests, /copy [n|all], /file <path> [caption], //text for a literal slash.
 
-From the Telegram chat (sys access needed for the first two):
-/status replies with a live server report (the services you added with
-`tgmessage service add`, CPU + temp, fan speed, RAM, disk, battery, IPs);
+From the Telegram chat (sys access needed for the first three):
+/status replies with a live server report (active uploads with ids, the services
+you added with `tgmessage service add`, CPU + temp, fan speed, RAM, disk,
+battery, IPs);
 /logs replies with the tail of the watcher system log
 (/root/tgmessage/watcher/logs/watcher.log; /logs 100 for more lines);
+/cancel_upload <id> stops an active upload listed by /status and deletes its
+partial file;
 /help lists these commands, and every photo/file you send is saved
 into the files/ folder (see TG_FILES_DIR in .env).
 """
