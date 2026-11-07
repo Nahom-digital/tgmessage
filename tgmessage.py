@@ -22,10 +22,12 @@ A bot can be messaged by many people, but it may only talk to people who are
 allowed. Permission levels are managed in .env by the CLI:
 
     tgmessage allow <id>         chat only (send/receive/files)
-    tgmessage allow sys <id>     + /status, /logs and /cancel_upload from Telegram
+    tgmessage allow sys <id>     + /status, /logs, /cancel_upload and the
+                                 opt-in /sh-on root shell from Telegram
     tgmessage allow mang <id>    + watcher reports and /recover (manage)
     tgmessage deny [sys|mang] <id>
     tgmessage service add <unit> watch a systemd service (restart + alert)
+    tgmessage shell on           enable /sh-on for sys chats (off by default)
 
 Anything from an unknown private chat is held as a *request*
 (state/pending.json) until you allow it:
@@ -87,6 +89,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -159,6 +162,33 @@ def parse_ids(raw):
             seen.add(cid)
             out.append(cid)
     return out
+
+
+def parse_bool(raw):
+    """Parse .env booleans: 1/true/yes/on (case-insensitive) mean true."""
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on", "y", "enabled")
+
+
+def parse_seconds(raw, default, minimum, maximum):
+    """Parse a bounded seconds setting, falling back to `default`."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def human_duration(seconds):
+    """600 -> '10m', 1800 -> '30m', 45 -> '45s'."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
 
 
 def id_sort_key(cid):
@@ -252,8 +282,12 @@ ENV_TEMPLATE = [
     ("TG_MAX_DOWNLOAD_MB", "", "max download size in MB (default: 20 cloud, 2000 local)"),
     ("TG_MAX_UPLOAD_MB", "", "max upload size in MB (default: 50 cloud, 2000 local)"),
     ("TG_ALLOWED_CHAT_IDS", "", "chat ids allowed to talk to this bot"),
-    ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status, /logs and /cancel_upload (tgmessage allow sys)"),
+    ("TG_SYS_CHAT_IDS", "", "chat ids allowed to use /status, /logs, /cancel_upload and the root shell (tgmessage allow sys)"),
     ("TG_MANG_CHAT_IDS", "", "chat ids that receive watcher reports (tgmessage allow mang)"),
+    ("TG_SHELL_ENABLED", "0", "root shell from Telegram for sys chats - /sh-on, /sh-off (tgmessage shell on)"),
+    ("TG_SHELL_IDLE_SECONDS", "600", "close an idle /sh-on shell after this many seconds"),
+    ("TG_SHELL_MAX_SECONDS", "1800", "maximum lifetime of one /sh-on shell, in seconds"),
+    ("TG_SHELL_TIMEOUT", "120", "kill a Telegram shell command after this many seconds"),
     ("TG_WATCH_SERVICES", "", "systemd services watched by the watcher (tgmessage service add)"),
     ("TG_SERVICE_NO_RESTART", "", "watched services the watcher reports but never restarts (tgmessage service <unit> stop)"),
     ("TG_DEFAULT_CHAT", "", "chat id used by one-shot sends and on startup"),
@@ -357,6 +391,14 @@ class Config:
         def get(key, default=""):
             return os.environ.get(key) or disk.get(key) or default
 
+        def shell_get(key, default=""):
+            # `.env` is the source of truth for the shell: systemd's
+            # EnvironmentFile has a stale copy in os.environ after the CLI
+            # edits the file.
+            if key in disk:
+                return disk[key]
+            return os.environ.get(key) or default
+
         self.token = get("TG_BOT_TOKEN").strip()
         self.allowed = parse_ids(get("TG_ALLOWED_CHAT_IDS"))
         self.sys = parse_ids(get("TG_SYS_CHAT_IDS"))
@@ -401,6 +443,16 @@ class Config:
             self.max_upload = default_upload_mb * 1024 * 1024
         self.history = int(get("TG_HISTORY", "300") or 300)
         self.poll_timeout = int(get("TG_POLL_TIMEOUT", "30") or 30)
+        # Root shell from Telegram: disabled unless explicitly turned on.
+        self.shell_enabled = parse_bool(shell_get("TG_SHELL_ENABLED", "0"))
+        self.shell_idle = parse_seconds(
+            shell_get("TG_SHELL_IDLE_SECONDS", "600"), 600, 60, 86400)
+        self.shell_max = max(
+            self.shell_idle,
+            parse_seconds(shell_get("TG_SHELL_MAX_SECONDS", "1800"), 1800, 60, 604800),
+        )
+        self.shell_timeout = parse_seconds(
+            shell_get("TG_SHELL_TIMEOUT", "120"), 120, 5, 3600)
         self.state_dir = os.path.join(self.home, "state")
         self.files_dir = os.path.abspath(os.path.expanduser(
             get("TG_FILES_DIR") or os.path.join(self.home, "files")))
@@ -571,8 +623,11 @@ class Telegram:
             timeout=self.cfg.poll_timeout + 20,
         )
 
-    def send_message(self, chat_id, text):
-        return self.call("sendMessage", {"chat_id": chat_id, "text": text}, timeout=30)
+    def send_message(self, chat_id, text, parse_mode=None):
+        params = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        return self.call("sendMessage", params, timeout=30)
 
     def send_document(self, chat_id, path, caption=None):
         """Upload a file with sendDocument (multipart/form-data, stdlib only)."""
@@ -945,6 +1000,251 @@ def message_text(msg):
                 return f"[{label}] {name}" + (f" ({size})" if size else "")
             return f"[{label}]"
     return "[message]"
+
+
+# --------------------------------------------------------------------------
+# /sh-on - root shell from a private Telegram chat (sys access only)
+# --------------------------------------------------------------------------
+
+SHELL_MAX_COMMAND = 4000           # Telegram text messages are 4096 max anyway
+SHELL_MAX_OUTPUT = 16 * 1024       # bytes kept for the Telegram reply
+SHELL_MAX_READ = 64 * 1024 * 1024  # total pipe read before a runaway is killed
+SHELL_CHUNK = 3500                 # UTF-16 units per Telegram reply (limit 4096)
+SHELL_MAX_CONCURRENT = 2           # total commands running across all chats
+SHELL_RATE_LIMIT = 20              # commands per chat ...
+SHELL_RATE_WINDOW = 60.0           # ... per this many seconds
+SHELL_STATE_FILE = "shell.json"    # active sessions survive a daemon restart
+
+_ANSI_ESCAPE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"           # CSI
+    r"|\x1b\][^\x07]*(?:\x07|\x1b\\)"    # OSC
+    r"|\x1b[@-_]"                        # other two-byte escapes
+)
+
+
+def current_boot_id():
+    """Identify this boot so shell sessions survive service, not machine, restarts."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def clean_terminal_output(data):
+    """Decode command output and remove control sequences Telegram cannot show."""
+    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
+    text = _ANSI_ESCAPE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    return text.strip("\n")
+
+
+def telegram_code_block(text):
+    """Wrap plain text in Telegram's <pre> code block, escaping HTML."""
+    text = str(text or "")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<pre>{text}</pre>"
+
+
+def split_message(text, limit=SHELL_CHUNK):
+    """Split long shell output into Telegram-sized chunks, preferring newlines.
+
+    Telegram counts UTF-16 code units, so an emoji can use two of the 4096
+    allowed units.  Splitting by units keeps every chunk valid.
+    """
+    text = str(text or "")
+    if len(text.encode("utf-16-le")) // 2 <= limit:
+        return [text]
+    chunks = []
+    start = 0
+    total = len(text)
+    while start < total:
+        end = start
+        units = 0
+        while end < total:
+            width = 2 if ord(text[end]) > 0xFFFF else 1
+            if units + width > limit:
+                break
+            units += width
+            end += 1
+        if end == start:  # a single over-wide character, should not happen
+            end += 1
+        cut = text.rfind("\n", start, end)
+        if cut >= start + (end - start) // 2:
+            end = cut
+        chunk = text[start:end].rstrip("\n")
+        if chunk:
+            chunks.append(chunk)
+        start = end
+        while start < total and text[start] == "\n":
+            start += 1
+    return chunks or [text]
+
+
+def kill_process_group(proc):
+    """Kill a command and every child it started, never raise."""
+    try:
+        # start_new_session=True makes the child its own process group leader.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_shell_command(command, cwd, timeout, max_output=SHELL_MAX_OUTPUT,
+                      max_total=SHELL_MAX_READ, on_start=None, cwd_file=None):
+    """Run one command with a time limit and bounded output.
+
+    Returns a dict with text/exit/timed_out/truncated/flooded.  Only
+    `max_output` bytes are kept for the reply, but the pipe keeps draining so
+    a large-but-legitimate command (apt upgrade) is not killed halfway.  A
+    command that reads more than `max_total` bytes is treated as a runaway and
+    killed.  stdin is /dev/null, so interactive programs fail fast.
+    """
+    home = os.path.expanduser("~")
+    env = {
+        # Fixed PATH: the shell must not accidentally pick up a user-writable
+        # directory from whatever environment the daemon inherited.
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": home or cwd,
+        "USER": getpass.getuser(),
+        "LOGNAME": getpass.getuser(),
+        "SHELL": "/bin/bash",
+        "TERM": "dumb",
+        "LANG": os.environ.get("LANG") or "C.UTF-8",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "SYSTEMD_PAGER": "cat",
+        "DEBIAN_FRONTEND": "noninteractive",
+        "NO_COLOR": "1",
+    }
+    if os.environ.get("LC_ALL"):
+        env["LC_ALL"] = os.environ["LC_ALL"]
+
+    script = command
+    if cwd_file:
+        # The EXIT trap records the final directory even for `cd`, `exit` or a
+        # failing command.  A clean, non-login shell keeps it predictable.
+        env["TG_SHELL_CWD_FILE"] = cwd_file
+        script = (
+            "trap 'printf \"%s\" \"$PWD\" > \"$TG_SHELL_CWD_FILE\"' EXIT\n"
+            + command
+        )
+
+    try:
+        proc = subprocess.Popen(
+            ["/bin/bash", "--noprofile", "--norc", "-c", script],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        return {
+            "text": f"could not start the shell: {exc}",
+            "exit": None,
+            "timed_out": False,
+            "truncated": False,
+            "flooded": False,
+        }
+
+    if on_start is not None:
+        try:
+            on_start(proc)
+        except Exception:  # noqa: BLE001 - a bad callback must not stop the command
+            pass
+
+    out = bytearray()
+    timed_out = False
+    truncated = False
+    flooded = False
+    total_read = 0
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    try:
+        while True:
+            if proc.poll() is not None:
+                # The shell exited: drain what is already in the pipe, then stop.
+                while True:
+                    try:
+                        data = os.read(fd, 65536)
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        break
+                    total_read += len(data)
+                    room = max_output - len(out)
+                    if room > 0:
+                        out += data[:room]
+                    if len(data) > room:
+                        truncated = True
+                    if total_read > max_total:
+                        flooded = True
+                        break
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+            except InterruptedError:
+                continue
+            if not ready:
+                continue
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not data:
+                break
+            total_read += len(data)
+            room = max_output - len(out)
+            if room > 0:
+                out += data[:room]
+            if len(data) > room:
+                truncated = True
+            if total_read > max_total:
+                flooded = True
+                break
+    finally:
+        if timed_out or flooded:
+            kill_process_group(proc)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            kill_process_group(proc)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+
+    text = clean_terminal_output(bytes(out)) or "(no output)"
+    if truncated:
+        text += f"\n[output truncated at {human_size(max_output)}]"
+    if flooded:
+        text += f"\n[output flood: {human_size(max_total)} read - command killed]"
+    if timed_out:
+        text += f"\n[timed out after {timeout}s - command killed]"
+    return {
+        "text": text,
+        "exit": proc.returncode,
+        "timed_out": timed_out,
+        "truncated": truncated,
+        "flooded": flooded,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1796,6 +2096,18 @@ def chat_help_text(cfg, is_sys=False, is_mang=False):
             "/logs   - last 40 lines of the watcher system log (/logs 100 for more)",
             "/cancel_upload <id> - stop an active upload listed by /status",
         ]
+        if getattr(cfg, "shell_enabled", False):
+            lines += [
+                "/sh_on  - open a root shell in this private chat (dangerous)",
+                "/sh_off - close the root shell and kill a running command",
+                "          /sh-on and /sh-off also work; while ON, send",
+                "          commands without a leading slash",
+            ]
+        else:
+            lines += [
+                "/sh_on / /sh_off - root shell is disabled on this host",
+                "          owner can enable it with: tgmessage shell on",
+            ]
         if is_mang:
             lines += [
                 "/recover [unit] - try hard to start a down watched service;",
@@ -1808,8 +2120,8 @@ def chat_help_text(cfg, is_sys=False, is_mang=False):
             ]
     else:
         lines += [
-            "/status, /logs and /cancel_upload need sys access - ask the bot owner to run:",
-            "  tgmessage allow sys <your-chat-id>",
+            "/status, /logs, /cancel_upload and the /sh_on root shell need sys access -",
+            "ask the bot owner to run: tgmessage allow sys <your-chat-id>",
         ]
     lines += [
         "",
@@ -1827,6 +2139,33 @@ def chat_help_text(cfg, is_sys=False, is_mang=False):
         "/requests, /copy and /file <path>.",
     ]
     return "\n".join(lines)
+
+
+# Telegram's command menu only accepts lowercase letters, digits and
+# underscores, so /sh-on and /sh-off are registered as /sh_on and /sh_off.
+# Both spellings work in the chat.
+BOT_COMMANDS = [
+    ("help", "Show the command list"),
+    ("status", "Server status: services, CPU, RAM, disk, transfers"),
+    ("logs", "Last lines of the watcher log"),
+    ("cancel_upload", "Cancel an active upload by id"),
+    ("recover", "Recover down watched services"),
+    ("sh_on", "Open the root shell in this private chat"),
+    ("sh_off", "Close the root shell"),
+]
+
+
+def register_bot_commands(cfg, tg=None):
+    """Publish the command menu shown when the user presses '/' in Telegram."""
+    if not cfg.token:
+        return False, "no bot token configured"
+    commands = [{"command": name, "description": desc} for name, desc in BOT_COMMANDS]
+    try:
+        (tg or Telegram(cfg)).call(
+            "setMyCommands", {"commands": json.dumps(commands)}, timeout=20)
+    except TelegramError as exc:
+        return False, str(exc)
+    return True, ""
 
 
 # --------------------------------------------------------------------------
@@ -1854,6 +2193,12 @@ class Daemon:
         self.seen = set()
         self.running = True
         self.download_queue = queue.Queue()
+        # /sh-on state is memory only: daemon restart, /sh-off, timeout or a
+        # permission change closes every session.
+        self.shell_sessions = {}
+        self.shell_lock = threading.Lock()
+        self.shell_slots = threading.Semaphore(SHELL_MAX_CONCURRENT)
+        self._load_shell_state()
 
     # ---- state -------------------------------------------------------
     def _offset_key(self):
@@ -1928,6 +2273,39 @@ class Daemon:
             default = sorted(allowed, key=id_sort_key)[0]
         self.default_chat = default
         self.cfg.watch_services = parse_units(disk.get("TG_WATCH_SERVICES"))
+
+        def setting(key, fallback=""):
+            # The systemd unit loads .env via EnvironmentFile, so the daemon's
+            # os.environ keeps the values from startup.  Prefer the file here
+            # or `tgmessage shell on/off` would not take effect until a full
+            # service restart.
+            if key in disk:
+                return disk[key]
+            return os.environ.get(key) or fallback
+
+        self.cfg.shell_enabled = parse_bool(setting("TG_SHELL_ENABLED", "0"))
+        self.cfg.shell_idle = parse_seconds(
+            setting("TG_SHELL_IDLE_SECONDS", "600"), 600, 60, 86400)
+        self.cfg.shell_max = max(
+            self.cfg.shell_idle,
+            parse_seconds(setting("TG_SHELL_MAX_SECONDS", "1800"), 1800, 60, 604800),
+        )
+        self.cfg.shell_timeout = parse_seconds(
+            setting("TG_SHELL_TIMEOUT", "120"), 120, 5, 3600)
+
+        # Turning the feature off, or revoking sys from a chat, closes live
+        # shells immediately (including any command still running).
+        with self.shell_lock:
+            dropped = []
+            for cid, sess in list(self.shell_sessions.items()):
+                if not self.cfg.shell_enabled or cid not in self.sys:
+                    dropped.append(self.shell_sessions.pop(cid))
+            self._persist_shell_locked()
+            if dropped:
+                log(self.cfg, f"shell mode: closed {len(dropped)} session(s) after a permission/config change")
+        for sess in dropped:
+            if sess.get("proc") is not None:
+                kill_process_group(sess["proc"])
 
     def _persist(self):
         persist_permissions(self.cfg, self.allowed, self.sys, self.mang, self.default_chat)
@@ -2148,18 +2526,31 @@ class Daemon:
         self.registry.touch(cid, meta, "in")
         self.broadcast({"type": "msg", **rec})
         if msg.get("text"):
-            self.maybe_chat_command(cid, text)
+            edited = "message" not in update
+            self.maybe_chat_command(
+                cid, text, chat_type=chat.get("type") or "", edited=edited)
         self.maybe_save_media(cid, msg)
 
     # ---- chat commands coming from Telegram ---------------------------
-    def maybe_chat_command(self, cid, text):
-        """Handle /commands typed in the Telegram chat itself."""
+    def maybe_chat_command(self, cid, text, chat_type="", edited=False):
+        """Handle /commands typed in the Telegram chat itself.
+
+        When a /sh-on session is active, plain messages are shell commands.
+        Bot commands keep working; /sh-off always closes the shell.  Edited
+        messages are never executed, so editing an old command cannot run it
+        twice.
+        """
         cmd = (text or "").strip()
+        if not cmd:
+            return
         if not cmd.startswith("/"):
+            self._maybe_shell_input(cid, cmd, chat_type, edited)
             return
         head = cmd.split()[0].lower()
         if "@" in head:  # /status@thebot in group chats
             head = head.split("@", 1)[0]
+        if self._shell_mode_take(cid, cmd, head, chat_type, edited):
+            return
         if head == "/status":
             if not self.can_sys(cid):
                 threading.Thread(target=self._chat_denied_reply, args=(cid, "/status", "sys"), daemon=True).start()
@@ -2200,15 +2591,23 @@ class Daemon:
             if len(parts) > 1:
                 target = parts[1]
             threading.Thread(target=self._chat_recover_reply, args=(cid, target), daemon=True).start()
+        elif head in ("/sh-on", "/sh_on"):
+            threading.Thread(target=self._chat_shell_on_reply, args=(cid, chat_type), daemon=True).start()
+        elif head in ("/sh-off", "/sh_off"):
+            threading.Thread(target=self._chat_shell_off_reply, args=(cid,), daemon=True).start()
         elif head in ("/help", "/start", "/commands"):
             threading.Thread(target=self._chat_help_reply, args=(cid,), daemon=True).start()
 
-    def _record_out(self, cid, text, send=True):
-        """Record an outgoing message; optionally deliver it to Telegram first."""
+    def _record_out(self, cid, text, send=True, parse_mode=None, history_text=None):
+        """Record an outgoing message; optionally deliver it to Telegram first.
+
+        `text` is what Telegram receives (possibly HTML), while `history_text`
+        keeps the terminal UI and chat history readable.
+        """
         result = None
         if send:
             try:
-                result = self.tg.send_message(cid, text)
+                result = self.tg.send_message(cid, text, parse_mode=parse_mode)
             except TelegramError as exc:
                 log(self.cfg, f"reply to {cid} failed: {exc}")
         rec = {
@@ -2216,7 +2615,7 @@ class Daemon:
             "dir": "out",
             "id": (result or {}).get("message_id"),
             "chat_id": cid,
-            "text": text,
+            "text": history_text if history_text is not None else text,
         }
         self.history.append(cid, rec)
         self.registry.touch(cid, {}, "out")
@@ -2329,6 +2728,421 @@ class Daemon:
         if len(text) > 3800:
             text = text[:3800].rstrip() + "\n… (report trimmed)"
         self._record_out(cid, text)
+
+    # ---- /sh-on: sys-only root shell in a private chat ----------------
+    @staticmethod
+    def _shell_private(cid, chat_type):
+        """Root shell is only allowed in a real private chat, never a group."""
+        return chat_type == "private" and looks_like_id(cid) and int(cid) > 0
+
+    def _shell_home(self):
+        home = os.path.expanduser("~")
+        return home if os.path.isdir(home) else self.cfg.home
+
+    @property
+    def _shell_state_path(self):
+        return os.path.join(self.cfg.state_dir, SHELL_STATE_FILE)
+
+    def _persist_shell_locked(self):
+        """Write active shell sessions to disk; caller holds shell_lock.
+
+        Only the session metadata is stored - never a process handle or a
+        command.  The boot id means a service restart keeps the shell on, but
+        a full machine reboot does not.
+        """
+        sessions = {}
+        for cid, sess in self.shell_sessions.items():
+            if not (looks_like_id(cid) and int(cid) > 0):
+                continue
+            sessions[cid] = {
+                "started": float(sess.get("started") or time.time()),
+                "last": float(sess.get("last") or time.time()),
+                "cwd": sess.get("cwd") or self._shell_home(),
+            }
+
+        path = self._shell_state_path
+        if not sessions:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        data = {"version": 1, "boot_id": current_boot_id(), "sessions": sessions}
+        try:
+            os.makedirs(self.cfg.state_dir, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+                fh.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _load_shell_state(self):
+        """Restore /sh-on sessions after a service restart (same boot only)."""
+        path = self._shell_state_path
+        if not self.cfg.shell_enabled:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, json.JSONDecodeError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        if not isinstance(data, dict) or data.get("boot_id") != current_boot_id():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        stored = data.get("sessions")
+        if not isinstance(stored, dict):
+            stored = {}
+
+        now = time.time()
+        restored = {}
+        for cid, rec in stored.items():
+            if cid not in self.sys or not (looks_like_id(cid) and int(cid) > 0):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            try:
+                started = float(rec.get("started") or now)
+                last = float(rec.get("last") or started)
+            except (TypeError, ValueError):
+                continue
+            if now - started >= self.cfg.shell_max or now - last >= self.cfg.shell_idle:
+                continue
+            cwd = str(rec.get("cwd") or "")
+            if not os.path.isdir(cwd):
+                cwd = self._shell_home()
+            restored[cid] = {
+                "started": started,
+                "last": last,
+                "busy": False,
+                "proc": None,
+                "times": [],
+                "cwd": cwd,
+            }
+
+        with self.shell_lock:
+            self.shell_sessions = restored
+            self._persist_shell_locked()
+        if restored:
+            log(self.cfg, f"restored {len(restored)} active shell session(s) after restart")
+
+    def _stop_shell_commands(self):
+        """Kill running commands on shutdown but keep the session state."""
+        with self.shell_lock:
+            procs = [
+                sess.get("proc") for sess in self.shell_sessions.values()
+                if sess.get("proc") is not None
+            ]
+            self._persist_shell_locked()
+        for proc in procs:
+            kill_process_group(proc)
+
+    def _shell_left(self, sess):
+        now = time.time()
+        return max(0, min(
+            sess["last"] + self.cfg.shell_idle - now,
+            sess["started"] + self.cfg.shell_max - now,
+        ))
+
+    def _shell_close(self, cid):
+        """Forget a session and kill the command it is running, if any."""
+        with self.shell_lock:
+            sess = self.shell_sessions.pop(cid, None)
+            proc = sess.get("proc") if sess else None
+            self._persist_shell_locked()
+        killed = proc is not None and proc.poll() is None
+        if proc is not None:
+            kill_process_group(proc)
+        return sess, killed
+
+    def _shell_mode_take(self, cid, cmd, head, chat_type, edited):
+        """Return True when an active shell session owns this message."""
+        with self.shell_lock:
+            active = cid in self.shell_sessions
+        if not active:
+            return False
+        if head in ("/sh-off", "/sh_off"):
+            threading.Thread(target=self._chat_shell_off_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/sh-on", "/sh_on"):
+            threading.Thread(target=self._chat_shell_on_reply, args=(cid, chat_type), daemon=True).start()
+            return True
+        if head in ("/help", "/start", "/commands",
+                    "/status", "/logs", "/cancel_upload", "/recover"):
+            return False
+        # Other slash text is a shell command too, so /bin/ls keeps working.
+        self._maybe_shell_input(cid, cmd, chat_type, edited)
+        return True
+
+    def _maybe_shell_input(self, cid, text, chat_type="", edited=False):
+        with self.shell_lock:
+            active = cid in self.shell_sessions
+        if not active:
+            return
+        if edited:
+            threading.Thread(
+                target=self._record_out,
+                args=(cid, "shell: edited messages are ignored - send the command again"),
+                daemon=True,
+            ).start()
+            return
+        self._chat_shell_run_async(cid, text, chat_type)
+
+    def _chat_shell_on_reply(self, cid, chat_type=""):
+        if not self.cfg.shell_enabled:
+            self._shell_close(cid)
+            self._record_out(
+                cid,
+                "root shell is disabled on this host.\n"
+                "Bot owner can enable it with: tgmessage shell on",
+            )
+            return
+        if not self.can_sys(cid):
+            self._shell_close(cid)
+            self._chat_denied_reply(cid, "/sh-on", "sys")
+            return
+        if not self._shell_private(cid, chat_type):
+            self._shell_close(cid)
+            self._record_out(cid, "refused: the root shell only works in a private chat.")
+            return
+
+        now = time.time()
+        created = False
+        with self.shell_lock:
+            sess = self.shell_sessions.get(cid)
+            if sess is not None and self._shell_left(sess) <= 0:
+                self.shell_sessions.pop(cid, None)
+                sess = None
+            if sess is None:
+                sess = {
+                    "started": now,
+                    "last": now,
+                    "busy": False,
+                    "proc": None,
+                    "times": [],
+                    "cwd": self._shell_home(),
+                }
+                self.shell_sessions[cid] = sess
+                created = True
+            left = self._shell_left(sess)
+            busy = sess.get("busy")
+            self._persist_shell_locked()
+
+        if not created:
+            state = "a command is still running" if busy else "ready"
+            self._record_out(
+                cid,
+                f"root shell is already ON ({state}, {human_duration(left)} left).\n"
+                "/sh-off closes it.",
+            )
+            return
+
+        log(self.cfg, f"/sh-on by chat {cid}")
+        host = socket.gethostname()
+        user = getpass.getuser()
+        uid = os.geteuid()
+        who = "root" if uid == 0 else f"{user} (uid {uid}, not root)"
+        text = "\n".join([
+            f"\U0001F510 root shell ON - {who} @ {host}",
+            "Every message in this private chat now runs as a shell command.",
+            f"Limits: {human_duration(self.cfg.shell_idle)} idle, "
+            f"{human_duration(self.cfg.shell_max)} max, "
+            f"{human_duration(self.cfg.shell_timeout)} per command.",
+            "Send commands without a leading slash; /status, /logs, /recover and /help still work.",
+            "cd is remembered between commands; exported variables are not.",
+            "\u26a0 This is full control of the server. Output is stored by Telegram "
+            "and in this bot's history.",
+            "/sh-off closes the shell and kills a running command.",
+        ])
+        self._record_out(cid, text)
+
+    def _chat_shell_off_reply(self, cid):
+        sess, killed = self._shell_close(cid)
+        if sess is None:
+            self._record_out(cid, "root shell is already OFF.")
+            return
+        log(self.cfg, f"/sh-off by chat {cid}" + (" (killed a running command)" if killed else ""))
+        note = " - running command killed" if killed else ""
+        self._record_out(cid, f"root shell OFF{note}.")
+
+    def _shell_try_begin(self, cid, chat_type):
+        """Atomically validate a session and reserve a command slot."""
+        with self.shell_lock:
+            sess = self.shell_sessions.get(cid)
+            if sess is None:
+                return None, "root shell is off - send /sh-on to start it."
+            if not self.cfg.shell_enabled:
+                self.shell_sessions.pop(cid, None)
+                self._persist_shell_locked()
+                return None, "root shell was disabled by the owner."
+            if not self.can_sys(cid):
+                self.shell_sessions.pop(cid, None)
+                self._persist_shell_locked()
+                return None, "permission revoked - root shell closed."
+            if not self._shell_private(cid, chat_type):
+                self.shell_sessions.pop(cid, None)
+                self._persist_shell_locked()
+                return None, "root shell closed: it only works in a private chat."
+            if sess.get("busy"):
+                return None, "a command is still running - wait, or /sh-off to kill it."
+
+            now = time.time()
+            if now - sess["started"] >= self.cfg.shell_max:
+                self.shell_sessions.pop(cid, None)
+                self._persist_shell_locked()
+                return None, (
+                    f"root shell reached its {human_duration(self.cfg.shell_max)} limit "
+                    "- send /sh-on again."
+                )
+            if now - sess["last"] >= self.cfg.shell_idle:
+                self.shell_sessions.pop(cid, None)
+                self._persist_shell_locked()
+                return None, (
+                    f"root shell closed after {human_duration(self.cfg.shell_idle)} idle "
+                    "- send /sh-on again."
+                )
+            times = [t for t in sess["times"] if now - t < SHELL_RATE_WINDOW]
+            sess["times"] = times
+            if len(times) >= SHELL_RATE_LIMIT:
+                return None, (
+                    f"shell rate limit: {SHELL_RATE_LIMIT} commands per "
+                    f"{int(SHELL_RATE_WINDOW)}s - wait a moment."
+                )
+            if not self.shell_slots.acquire(blocking=False):
+                return None, "too many shell commands are running - try again in a moment."
+
+            sess["busy"] = True
+            sess["last"] = now
+            times.append(now)
+            self._persist_shell_locked()
+            return sess, None
+
+    def _chat_shell_run_async(self, cid, command, chat_type=""):
+        if len(command) > SHELL_MAX_COMMAND:
+            threading.Thread(
+                target=self._record_out,
+                args=(cid, f"shell: command too long (max {SHELL_MAX_COMMAND} characters)."),
+                daemon=True,
+            ).start()
+            return
+        sess, error = self._shell_try_begin(cid, chat_type)
+        if error is not None:
+            threading.Thread(target=self._record_out, args=(cid, error), daemon=True).start()
+            return
+        threading.Thread(
+            target=self._chat_shell_exec, args=(cid, command, sess), daemon=True).start()
+
+    def _chat_shell_exec(self, cid, command, sess):
+        started = time.monotonic()
+        cwd = sess.get("cwd") or self._shell_home()
+        if not os.path.isdir(cwd):
+            cwd = self._shell_home()
+            sess["cwd"] = cwd
+
+        def register(proc):
+            with self.shell_lock:
+                keep = self.shell_sessions.get(cid) is sess
+                if keep:
+                    sess["proc"] = proc
+            if not keep:
+                kill_process_group(proc)
+
+        try:
+            fd, cwd_file = tempfile.mkstemp(prefix=".shell-cwd-", dir=self.cfg.state_dir)
+            os.close(fd)
+        except OSError:
+            cwd_file = None
+
+        try:
+            result = run_shell_command(
+                command, cwd, self.cfg.shell_timeout,
+                on_start=register, cwd_file=cwd_file)
+        except Exception as exc:  # noqa: BLE001
+            log(self.cfg, f"shell command crashed: {exc!r}")
+            result = {
+                "text": f"shell error: {exc!r}",
+                "exit": None,
+                "timed_out": False,
+                "truncated": False,
+                "flooded": False,
+            }
+
+        new_cwd = None
+        if cwd_file:
+            try:
+                with open(cwd_file, encoding="utf-8", errors="replace") as fh:
+                    candidate = fh.read(4096).strip()
+                if candidate and os.path.isdir(candidate):
+                    new_cwd = candidate
+            except OSError:
+                pass
+            try:
+                os.unlink(cwd_file)
+            except OSError:
+                pass
+
+        elapsed = time.monotonic() - started
+        if result.get("flooded"):
+            status = f"output flood killed after {human_size(SHELL_MAX_READ)}"
+        elif result.get("timed_out"):
+            status = f"timed out after {self.cfg.shell_timeout}s"
+        elif result.get("exit") is None:
+            status = "failed to start"
+        else:
+            status = f"exit {result['exit']}"
+
+        try:
+            with self.shell_lock:
+                keep = self.shell_sessions.get(cid) is sess
+                if keep and new_cwd:
+                    sess["cwd"] = new_cwd
+                expired = bool(keep and time.time() - sess["started"] >= self.cfg.shell_max)
+            if keep:
+                shown = command if len(command) <= 500 else command[:500] + "…"
+                text = f"$ {shown}\n{result['text']}\n\n[{status} · {elapsed:.1f}s]"
+                if expired:
+                    text += (
+                        f"\n[shell session reached its {human_duration(self.cfg.shell_max)} "
+                        "limit - send /sh-on again]"
+                    )
+                for chunk in split_message(text):
+                    self._record_out(
+                        cid,
+                        telegram_code_block(chunk),
+                        parse_mode="HTML",
+                        history_text=chunk,
+                    )
+            log_cmd = command if len(command) <= 300 else command[:300] + "…"
+            log(
+                self.cfg,
+                f"shell {cid}: {log_cmd!r} -> {status} in {elapsed:.1f}s"
+                + ("" if keep else " (session closed, output dropped)"),
+            )
+        except Exception as exc:  # noqa: BLE001 - never kill the worker thread
+            log(self.cfg, f"shell reply for {cid} failed: {exc!r}")
+        finally:
+            with self.shell_lock:
+                if self.shell_sessions.get(cid) is sess:
+                    sess["busy"] = False
+                    sess["proc"] = None
+                    sess["last"] = time.time()
+                    if time.time() - sess["started"] >= self.cfg.shell_max:
+                        self.shell_sessions.pop(cid, None)
+                self._persist_shell_locked()
+                self.shell_slots.release()
 
     # ---- incoming files: saved into <home>/files ----------------------
     def maybe_save_media(self, cid, msg):
@@ -2661,6 +3475,7 @@ class Daemon:
             ),
         )
         self._write_pid()
+        threading.Thread(target=self._register_commands, daemon=True).start()
         threading.Thread(target=self.poll_loop, daemon=True).start()
         threading.Thread(target=self._download_worker, daemon=True).start()
         threading.Thread(target=self.refresh_allowed, daemon=True).start()
@@ -2669,7 +3484,16 @@ class Daemon:
         try:
             self.serve()
         finally:
+            self._stop_shell_commands()
             self._clear_pid()
+
+    def _register_commands(self):
+        """Keep the Telegram '/' menu in sync with the commands we support."""
+        ok, err = register_bot_commands(self.cfg, self.tg)
+        if ok:
+            log(self.cfg, f"registered {len(BOT_COMMANDS)} Telegram bot commands")
+        else:
+            log(self.cfg, f"could not register Telegram bot commands: {err}")
 
     def _stop(self, *_):
         self.running = False
@@ -4292,10 +5116,13 @@ tgmessage - Telegram from any terminal, one session per chat.
   tgmessage requests, --request  list chats waiting to be allowed
 
   tgmessage allow <id> [...]     allow a chat to talk to the bot
-  tgmessage allow sys <id> ...   + /status, /logs and /cancel_upload from Telegram
+  tgmessage allow sys <id> ...   + /status, /logs, /cancel_upload and root shell
   tgmessage allow mang <id> ...  + watcher reports (manage)
   tgmessage deny <id> [...]      revoke everything for a chat
   tgmessage deny sys|mang <id>   revoke only that level
+
+  tgmessage shell on|off|status  enable/disable the /sh-on root shell (for sys chats)
+  tgmessage commands [register|show]  sync the Telegram '/' command menu
 
   tgmessage service add <unit> [...]      watch a systemd service
   tgmessage service remove|rem <unit> [...]  stop watching it
@@ -4320,7 +5147,7 @@ tgmessage - Telegram from any terminal, one session per chat.
 In the UI: /session [n|id] pick a chat, /allow [sys|mang] <id>, /deny <id>,
 /requests, /copy [n|all], /file <path> [caption], //text for a literal slash.
 
-From the Telegram chat (sys access needed for the first three):
+From the Telegram chat (sys access needed for the first four):
 /status replies with a live server report (active uploads with ids, the services
 you added with `tgmessage service add`, CPU + temp, fan speed, RAM, disk,
 battery, IPs);
@@ -4328,8 +5155,12 @@ battery, IPs);
 (/root/tgmessage/watcher/logs/watcher.log; /logs 100 for more lines);
 /cancel_upload <id> stops an active upload listed by /status and deletes its
 partial file;
-/help lists these commands, and every photo/file you send is saved
-into the files/ folder (see TG_FILES_DIR in .env).
+/sh_on opens a root shell in a private chat (disabled by default; enable with
+`tgmessage shell on`), then every plain message runs as a root command;
+/sh_off closes it (/sh-on and /sh-off are accepted too); /help lists these
+commands; every photo/file you send is saved into files/ (see TG_FILES_DIR).
+The Telegram '/' menu is registered automatically; sync it with
+`tgmessage commands`.
 """
 
 
@@ -4406,6 +5237,7 @@ def cmd_token(cfg, colours, rest):
     print(f"  TG_ALLOWED_CHAT_IDS={','.join(cfg.allowed) or '(none)'}")
     print(f"  TG_SYS_CHAT_IDS={','.join(cfg.sys) or '(none)'}")
     print(f"  TG_MANG_CHAT_IDS={','.join(cfg.mang) or '(none)'}")
+    print(f"  TG_SHELL_ENABLED={'1' if cfg.shell_enabled else '0'}")
     print(f"  TG_WATCH_SERVICES={','.join(cfg.watch_services) or '(none)'}")
     print(f"  TG_SERVICE_NO_RESTART={','.join(cfg.service_no_restart) or '(none)'}")
     print(f"  TG_DEFAULT_CHAT={cfg.default_chat or '(none)'}")
@@ -4565,6 +5397,71 @@ def cmd_deny(cfg, colours, rest):
     return _apply_allow(cfg, colours, ids, allow=False, level=level)
 
 
+def cmd_shell(cfg, colours, rest):
+    """Enable/disable the Telegram root shell, or show its settings."""
+    c = colours
+    action = (rest[0].lower() if rest else "status")
+    if action not in ("on", "off", "status", "enable", "disable", "show"):
+        print("usage: tgmessage shell on|off|status", file=sys.stderr)
+        return 2
+
+    if action in ("on", "enable"):
+        write_env(cfg.home, {"TG_SHELL_ENABLED": "1"})
+        cfg.shell_enabled = True
+        print(f"{c['red']}root shell ENABLED{c['rst']} - sys chats can now use /sh-on")
+        print("  sys access + a private chat are required; use `tgmessage shell off` to revoke")
+    elif action in ("off", "disable"):
+        write_env(cfg.home, {"TG_SHELL_ENABLED": "0"})
+        cfg.shell_enabled = False
+        print(f"{c['green']}root shell DISABLED{c['rst']} - /sh-on is refused and open shells close")
+    else:
+        state = f"{c['red']}ON (dangerous){c['rst']}" if cfg.shell_enabled else "off"
+        print(f"root shell: {state}")
+        print(f"  idle timeout    {human_duration(cfg.shell_idle)}")
+        print(f"  max session     {human_duration(cfg.shell_max)}")
+        print(f"  command timeout {human_duration(cfg.shell_timeout)}")
+        print(f"  allowed chats   sys users only: "
+              f"{', '.join(sorted(cfg.sys, key=id_sort_key)) or '(none)'}")
+        print("  private chats   required")
+        return 0
+
+    if notify_daemon(cfg, {"cmd": "reload"}):
+        print(f"  {c['dim']}daemon reloaded{c['rst']}")
+    else:
+        print(f"  {c['yellow']}daemon not reachable - it will pick this up on next restart{c['rst']}")
+    return 0
+
+
+def cmd_commands(cfg, colours, rest):
+    """Register or show the command menu Telegram displays when pressing '/'."""
+    c = colours
+    action = (rest[0].lower() if rest else "register")
+    if action in ("register", "set", "sync", "update"):
+        ok, err = register_bot_commands(cfg)
+        if not ok:
+            print(f"! could not register commands: {err}", file=sys.stderr)
+            return 1
+        print(f"{c['green']}registered {len(BOT_COMMANDS)} commands{c['rst']} in the Telegram '/' menu")
+        for name, desc in BOT_COMMANDS:
+            print(f"  /{name:<14} {c['dim']}{desc}{c['rst']}")
+        return 0
+    if action in ("show", "list", "status"):
+        try:
+            rows = Telegram(cfg).call("getMyCommands", {}) or []
+        except TelegramError as exc:
+            print(f"! could not read commands: {exc}", file=sys.stderr)
+            return 1
+        if not rows:
+            print("no commands registered - run: tgmessage commands register")
+            return 0
+        print(f"{c['b']}Telegram '/' menu{c['rst']}")
+        for row in rows:
+            print(f"  /{row.get('command', ''):<14} {c['dim']}{row.get('description', '')}{c['rst']}")
+        return 0
+    print("usage: tgmessage commands [register|show]", file=sys.stderr)
+    return 2
+
+
 def _service_list(cfg):
     return list(cfg.watch_services)
 
@@ -4684,6 +5581,8 @@ def cmd_status(cfg, colours, rest):
     print(f"  allowed       {', '.join(sorted(cfg.allowed, key=id_sort_key)) or '(none)'}")
     print(f"  sys           {', '.join(sorted(cfg.sys, key=id_sort_key)) or '(none)'}")
     print(f"  mang          {', '.join(sorted(cfg.mang, key=id_sort_key)) or '(none)'}")
+    shell = "ON (dangerous)" if cfg.shell_enabled else "off (tgmessage shell on)"
+    print(f"  root shell    {shell}")
     print(f"  services      {', '.join(cfg.watch_services) or '(none - tgmessage service add)'}")
     print(f"  default chat  {cfg.default_chat or '(none)'}")
     print(f"  listening     {cfg.host}:{cfg.port}")
@@ -4806,6 +5705,9 @@ COMMANDS = {
     "request": cmd_requests,
     "allow": cmd_allow,
     "deny": cmd_deny,
+    "shell": cmd_shell,
+    "commands": cmd_commands,
+    "command": cmd_commands,
     "service": cmd_service,
     "services": lambda cfg, colours, rest: cmd_service(cfg, colours, ["list"]),
     "local-api": cmd_local_api,

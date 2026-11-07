@@ -24,6 +24,7 @@ tgmessage requests                # message your bot first; your id shows here
 tgmessage allow <your-chat-id>    # chat access
 tgmessage allow sys <your-id>     # + /status, /logs and /cancel_upload
 tgmessage allow mang <your-id>    # + watcher reports (recommended for you)
+tgmessage shell on                # optional: allow /sh-on root shell for sys chats
 
 tgmessage service add <unit>      # watch a service (down -> restart + alert)
 tgmessage status                  # bridge health
@@ -44,16 +45,19 @@ opt-in and managed from the CLI (or `/allow` in the UI):
 | command | gives |
 |---|---|
 | `tgmessage allow <id>` | chat, files, history |
-| `tgmessage allow sys <id>` | + `/status`, `/logs` and `/cancel_upload` in Telegram |
+| `tgmessage allow sys <id>` | + `/status`, `/logs`, `/cancel_upload` and the opt-in root shell in Telegram |
 | `tgmessage allow mang <id>` | + watcher reports and `/recover` (manage); `mang` implies `sys` |
 
 Revoke with `tgmessage deny [sys\|mang] <id>`; a plain deny removes everything.
 The watcher sends **nothing** until at least one `mang` chat exists.
 
+The root shell is **off by default** even for sys chats. Enable it explicitly
+with `tgmessage shell on` (see [Root shell](#root-shell-opt-in-dangerous)).
+
 ## Telegram chat commands
 
-`/help` works for every allowed chat. The first three need `sys` access;
-`/recover` needs `mang` access.
+`/help` works for every allowed chat. `/status`, `/logs`, `/cancel_upload` and
+the root shell need `sys` access; `/recover` needs `mang` access.
 
 | command | does |
 |---|---|
@@ -61,8 +65,72 @@ The watcher sends **nothing** until at least one `mang` chat exists.
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
 | `/cancel_upload <id>` | stop a queued/active transfer shown in `/status` and remove its partial file |
 | `/recover [unit]` | try hard to start a down watched service (unmask/enable if needed, reset-failed, start, retry); without a unit it recovers every down watched service and appends the last journal lines of any service that stays down |
+| `/sh_on` (`/sh-on`) | open an opt-in root shell in this private chat; every following plain message is run as a command |
+| `/sh_off` (`/sh-off`) | close the root shell and kill a command that is still running |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
+
+The bot registers this list in Telegram's `/` command menu on startup.
+Telegram only allows lowercase letters, digits and underscores in menu
+commands, so the menu shows `/sh_on` and `/sh_off`; `/sh-on` and `/sh-off`
+still work if typed. Sync it manually with `tgmessage commands`.
+
+### Root shell (opt-in, dangerous)
+
+`/sh-on` gives the chat **full control of the machine as root** - the same
+privileges as the tgmessage systemd service. It is disabled by default and
+must be enabled from the console:
+
+```bash
+tgmessage shell on       # allow /sh-on for sys chats
+tgmessage shell status   # state + timeout settings + sys chats
+tgmessage shell off      # refuse /sh-on and close every open shell now
+```
+
+When enabled, only chats with `sys` access and only **private** chats can use
+it. Groups, non-sys chats and the terminal UI are refused.
+
+While a shell is on, send commands as ordinary messages (no leading `/`);
+known bot commands (`/status`, `/logs`, `/recover`, `/help`) still work.
+`/sh_off` closes the session immediately. Shell replies are sent as Telegram
+`<pre>` code blocks, so long output is monospace and has Telegram's copy button.
+Each command runs in a clean non-login `bash`; `cd` is remembered between
+messages, but exported variables, aliases and shell functions are not.
+Interactive programs are not supported.
+
+Active shell sessions are saved in `state/shell.json` (mode `600`) and are
+restored when the tgmessage **service** restarts, including their `cd`
+directory and remaining idle/max lifetime. A full machine reboot closes them
+(the boot id is recorded), and revoking `sys`, `tgmessage shell off`, or
+`/sh_off` removes them.
+
+Safety limits (all configurable in `.env`):
+
+| setting | default | meaning |
+|---|---|---|
+| `TG_SHELL_ENABLED` | `0` | feature gate; `/sh-on` is refused while off |
+| `TG_SHELL_IDLE_SECONDS` | `600` | close the shell after this much inactivity |
+| `TG_SHELL_MAX_SECONDS` | `1800` | maximum lifetime of one shell session |
+| `TG_SHELL_TIMEOUT` | `120` | kill one command after this many seconds |
+
+Also enforced in code:
+
+- one command at a time per chat, at most 2 commands total
+- 20 commands per minute per chat
+- 16 KB of output kept per command; extra output is discarded, so `apt upgrade`
+  is not interrupted, but a runaway that reads 64 MB is killed
+- stdin is `/dev/null`, so interactive programs fail instead of hanging forever
+- output is split into Telegram-sized messages
+- edited messages are never executed (a command cannot run twice)
+- revoking `sys`, running `tgmessage shell off`, or restarting the daemon
+  closes live shells; `/sh-off` also kills a running command
+- every command and exit status is written to `state/daemon.log`
+
+The command runs with the daemon's OS user (root when installed with the
+provided service). Output and commands are stored by Telegram and in
+`state/<chatid>.jsonl`, so do not run commands whose output contains secrets
+you do not want in those places. For anything long-running, use `nohup`/tmux
+or a systemd unit instead of keeping a chat shell open.
 
 ## Local Bot API (large files)
 
@@ -182,6 +250,8 @@ tgmessage requests               # pending requests (or --request)
 tgmessage allow <id> [...]             # chat access
 tgmessage allow sys|mang <id> [...]    # raise the level
 tgmessage deny [sys|mang] <id> [...]   # lower/remove access
+tgmessage shell on|off|status          # enable/disable the Telegram root shell
+tgmessage commands [register|show]     # sync the Telegram '/' command menu
 
 tgmessage service add <unit> [...]     # watch a systemd service
 tgmessage service remove <unit> [...]  # stop watching (alias: rem)
@@ -287,8 +357,12 @@ TG_LOCAL_API_JOBS=1         # build jobs (1 = low-end friendly)
 TG_MAX_DOWNLOAD_MB=         # empty = 20 cloud / 2000 local
 TG_MAX_UPLOAD_MB=           # empty = 50 cloud / 2000 local
 TG_ALLOWED_CHAT_IDS=...     # chat access
-TG_SYS_CHAT_IDS=...         # /status, /logs and /cancel_upload
+TG_SYS_CHAT_IDS=...         # /status, /logs, /cancel_upload + root shell
 TG_MANG_CHAT_IDS=...        # watcher reports
+TG_SHELL_ENABLED=0          # 1 = allow /sh-on for sys chats (dangerous)
+TG_SHELL_IDLE_SECONDS=600   # close an idle shell after 10m
+TG_SHELL_MAX_SECONDS=1800   # maximum shell lifetime (30m)
+TG_SHELL_TIMEOUT=120        # kill one command after 2m
 TG_WATCH_SERVICES=...       # services the watcher watches
 TG_SERVICE_NO_RESTART=...   # watched services it should only report (no restart)
 TG_DEFAULT_CHAT=...
@@ -311,6 +385,12 @@ journalctl -u watcher -n 50      # or: tail -f watcher/logs/watcher.log
 - **nothing shows up** - the chat is probably not allowed: `tgmessage requests`,
   then `tgmessage allow <chatid>`.
 - **`/status` says permission denied** - grant sys: `tgmessage allow sys <id>`.
+- **`/sh-on` says the root shell is disabled** - enable it from the console:
+  `tgmessage shell on`; check with `tgmessage shell status`.
+- **`/sh_on` refuses the chat** - it only works in a private chat with `sys`
+  access, never in a group. `/sh-on` works too if typed.
+- **the `/` menu is empty or stale** - run `tgmessage commands`, then reopen
+  the Telegram chat and press `/`.
 - **no watcher messages** - grant mang: `tgmessage allow mang <id>`.
 - **daemon not reachable** - `tgmessage up`.
 - **token rejected** - re-copy it from BotFather and run
