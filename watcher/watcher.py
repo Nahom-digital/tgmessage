@@ -896,10 +896,21 @@ def other_failed_units():
 
 
 def report_failed_units() -> None:
-    for unit in other_failed_units():
+    failed = other_failed_units()
+    alerts = STATE.setdefault("alerts", {})
+    # If a unit recovered, forget the old alert so a new failure is reported.
+    for key in [k for k in alerts if k.startswith("failed:") and k[7:] not in failed]:
+        alerts.pop(key, None)
+    for unit in failed:
+        if re.fullmatch(r"session-[^.]+\.scope", unit):
+            # Transient login scopes can lose a race with logind and stay
+            # marked failed forever; they are not service failures.
+            sc("reset-failed", unit, timeout=10)
+            log.debug("cleared stale login session unit: %s", unit)
+            continue
         log.warning("unrelated failed unit: %s", unit)
         notify("watcher: unrelated systemd unit failed: %s" % unit,
-               key="failed:%s" % unit, dedupe=3600)
+               key="failed:%s" % unit, dedupe=86400)
 
 
 # --------------------------------------------------------------------------- #

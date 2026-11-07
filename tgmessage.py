@@ -23,7 +23,7 @@ allowed. Permission levels are managed in .env by the CLI:
 
     tgmessage allow <id>         chat only (send/receive/files)
     tgmessage allow sys <id>     + /status, /logs and /cancel_upload from Telegram
-    tgmessage allow mang <id>    + watcher reports (manage)
+    tgmessage allow mang <id>    + watcher reports and /recover (manage)
     tgmessage deny [sys|mang] <id>
     tgmessage service add <unit> watch a systemd service (restart + alert)
 
@@ -1535,6 +1535,145 @@ def system_status_text(cfg):
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# /recover - try hard to bring watched services back to life
+# --------------------------------------------------------------------------
+
+RECOVER_ATTEMPTS = 3
+RECOVER_START_TIMEOUT = 60        # systemctl start blocks while a unit activates
+RECOVER_WAITS = (3, 6, 10)        # settle time after each start attempt
+RECOVER_JOURNAL_LINES = 8         # journal lines shown for units that stay down
+RECOVER_JOURNAL_MAX_CHARS = 600   # per unit, so the report stays Telegram-sized
+
+
+def _run_quiet(cmd, timeout=15):
+    """Run a command, never raise.  None on timeout or OSError."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _unit_state(verb, unit):
+    """systemctl is-enabled / is-active answer: active, enabled, not-found, ?"""
+    res = _run_quiet(["systemctl", verb, unit], timeout=10)
+    if res is None:
+        return "?"
+    out = (res.stdout or "").strip()
+    if out:
+        return out
+    if res.returncode != 0 and "no such file" in (res.stderr or "").lower():
+        return "not-found"
+    return "?"
+
+
+def _unit_journal_tail(unit, n=RECOVER_JOURNAL_LINES, max_chars=RECOVER_JOURNAL_MAX_CHARS):
+    """The newest journal lines of one unit, oldest first, trimmed to fit."""
+    res = _run_quiet(["journalctl", "-u", unit, "-n", str(n), "--no-pager",
+                      "-o", "cat"], timeout=20)
+    if res is None:
+        return []
+    text = (res.stdout or res.stderr or "").strip()
+    if not text:
+        return []
+    out = [line.rstrip()[:160] for line in text.splitlines()[-n:]]
+    while out and sum(len(l) + 1 for l in out) > max_chars:
+        out.pop(0)
+    return out
+
+
+def recover_services(cfg, target=None):
+    """Try hard to start every down service in the watch list.
+
+    This is the engine behind the Telegram /recover command.  For each watched
+    unit that is not active it unmasks/enables it when needed, resets the
+    failed state, starts it and re-checks, retrying a few times with a settling
+    pause.  Report-only units (TG_SERVICE_NO_RESTART) are included because
+    /recover is an explicit operator command - the watcher itself still never
+    touches them.  Returns the Telegram-ready report text.
+    """
+    home = getattr(cfg, "home", None) or DEFAULT_HOME
+    disk = read_env(home)
+    watch = parse_units(disk.get("TG_WATCH_SERVICES"))
+    no_restart = set(parse_units(disk.get("TG_SERVICE_NO_RESTART")))
+
+    if target:
+        want = normalize_unit(target)
+        if not want:
+            return f"recover: {target!r} is not a valid systemd unit name"
+        if want not in watch:
+            return (
+                f"recover: {want} is not in the watch list.\n"
+                "Add it with: tgmessage service add <unit>"
+            )
+        units = [want]
+    else:
+        units = watch
+
+    if not units:
+        return "recover: no services are configured - add one with: tgmessage service add <name>"
+
+    if not has_systemd():
+        return "recover: systemd is not available on this host - nothing to start"
+
+    lines = [f"\U0001F504 recover - {socket.gethostname()}"]
+    up = 0
+    missing = []
+    down = []
+    for unit in units:
+        label = unit[: -len(".service")] if unit.endswith(".service") else unit
+        tag = " [notify-only]" if unit in no_restart else ""
+
+        enabled = _unit_state("is-enabled", unit)
+        if enabled == "not-found":
+            lines.append(f"{label}: not installed - nothing to start")
+            missing.append(label)
+            continue
+        if enabled in ("disabled", "masked", "bad"):
+            if enabled == "masked":
+                _run_quiet(["systemctl", "unmask", unit], timeout=20)
+            _run_quiet(["systemctl", "enable", unit], timeout=30)
+
+        active = _unit_state("is-active", unit)
+        if active in ("active", "activating"):
+            lines.append(f"{label}: OK ({active}){tag}")
+            up += 1
+            continue
+
+        attempts = 0
+        for attempt in range(RECOVER_ATTEMPTS):
+            attempts = attempt + 1
+            _run_quiet(["systemctl", "reset-failed", unit], timeout=20)
+            _run_quiet(["systemctl", "start", unit], timeout=RECOVER_START_TIMEOUT)
+            time.sleep(RECOVER_WAITS[min(attempt, len(RECOVER_WAITS) - 1)])
+            active = _unit_state("is-active", unit)
+            if active in ("active", "activating"):
+                break
+        plural = "" if attempts == 1 else "s"
+        if active in ("active", "activating"):
+            up += 1
+            lines.append(f"{label}: STARTED after {attempts} attempt{plural}{tag} ✅")
+        else:
+            lines.append(f"{label}: STILL {active} after {attempts} attempt{plural}{tag} ❌")
+            down.append((unit, label, active))
+
+    lines.append("")
+    lines.append(f"result: {up}/{len(units)} up")
+    if missing:
+        lines.append(f"not installed: {', '.join(missing)} - install them first")
+
+    for unit, label, active in down:
+        lines.append("")
+        lines.append(f"{label} ({active}) - last journal lines:")
+        tail = _unit_journal_tail(unit)
+        if tail:
+            lines += ["  " + l for l in tail]
+        else:
+            lines.append("  (no journal entries)")
+
+    return "\n".join(lines)
+
+
 def watcher_log_tail(cfg, lines=40, max_chars=3800):
     """The last `lines` lines of the watcher log, ready as a Telegram reply.
 
@@ -1644,7 +1783,7 @@ def incoming_media(msg):
     return None
 
 
-def chat_help_text(cfg, is_sys=False):
+def chat_help_text(cfg, is_sys=False, is_mang=False):
     lines = [
         "tgmessage commands (from the Telegram chat):",
         "",
@@ -1657,6 +1796,16 @@ def chat_help_text(cfg, is_sys=False):
             "/logs   - last 40 lines of the watcher system log (/logs 100 for more)",
             "/cancel_upload <id> - stop an active upload listed by /status",
         ]
+        if is_mang:
+            lines += [
+                "/recover [unit] - try hard to start a down watched service;",
+                "                  without a unit it recovers every down watched service",
+            ]
+        else:
+            lines += [
+                "/recover needs mang access - ask the bot owner to run:",
+                "  tgmessage allow mang <your-chat-id>",
+            ]
     else:
         lines += [
             "/status, /logs and /cancel_upload need sys access - ask the bot owner to run:",
@@ -2042,6 +2191,15 @@ class Daemon:
                 if upload_id is not None and upload_id <= 0:
                     upload_id = None
             threading.Thread(target=self._chat_cancel_upload_reply, args=(cid, upload_id), daemon=True).start()
+        elif head == "/recover":
+            if not self.can_mang(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/recover", "mang"), daemon=True).start()
+                return
+            target = None
+            parts = cmd.split()
+            if len(parts) > 1:
+                target = parts[1]
+            threading.Thread(target=self._chat_recover_reply, args=(cid, target), daemon=True).start()
         elif head in ("/help", "/start", "/commands"):
             threading.Thread(target=self._chat_help_reply, args=(cid,), daemon=True).start()
 
@@ -2152,7 +2310,25 @@ class Daemon:
 
     def _chat_help_reply(self, cid):
         log(self.cfg, f"/help requested by chat {cid}")
-        self._record_out(cid, chat_help_text(self.cfg, is_sys=self.can_sys(cid)))
+        self._record_out(
+            cid,
+            chat_help_text(self.cfg, is_sys=self.can_sys(cid), is_mang=self.can_mang(cid)),
+        )
+
+    def _chat_recover_reply(self, cid, target=None):
+        log(self.cfg, f"/recover requested by chat {cid} ({target or 'every down watched service'})")
+        self._record_out(
+            cid,
+            "\U0001F504 recover: checking the watched services (this can take a minute)...",
+        )
+        try:
+            text = recover_services(self.cfg, target=target)
+        except Exception as exc:  # noqa: BLE001
+            log(self.cfg, f"/recover failed: {exc!r}")
+            text = f"recover error: {exc!r}"
+        if len(text) > 3800:
+            text = text[:3800].rstrip() + "\n… (report trimmed)"
+        self._record_out(cid, text)
 
     # ---- incoming files: saved into <home>/files ----------------------
     def maybe_save_media(self, cid, msg):

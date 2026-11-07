@@ -45,20 +45,22 @@ opt-in and managed from the CLI (or `/allow` in the UI):
 |---|---|
 | `tgmessage allow <id>` | chat, files, history |
 | `tgmessage allow sys <id>` | + `/status`, `/logs` and `/cancel_upload` in Telegram |
-| `tgmessage allow mang <id>` | + watcher reports (manage); `mang` implies `sys` |
+| `tgmessage allow mang <id>` | + watcher reports and `/recover` (manage); `mang` implies `sys` |
 
 Revoke with `tgmessage deny [sys\|mang] <id>`; a plain deny removes everything.
 The watcher sends **nothing** until at least one `mang` chat exists.
 
 ## Telegram chat commands
 
-`/help` works for every allowed chat. The first three need `sys` access.
+`/help` works for every allowed chat. The first three need `sys` access;
+`/recover` needs `mang` access.
 
 | command | does |
 |---|---|
 | `/status` | server report: queued/active transfers with ids, %, downloaded/total size, speed, watched services, CPU, temp, fan, RAM, disk, battery, IPs |
 | `/logs [n]` | last `n` lines of the watcher log (default 40) |
 | `/cancel_upload <id>` | stop a queued/active transfer shown in `/status` and remove its partial file |
+| `/recover [unit]` | try hard to start a down watched service (unmask/enable if needed, reset-failed, start, retry); without a unit it recovers every down watched service and appends the last journal lines of any service that stays down |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
 
