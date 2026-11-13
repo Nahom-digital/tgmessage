@@ -22,7 +22,7 @@ sudo ./install.sh --token '123456789:AA...'   # installs bot + watcher
 
 tgmessage requests                # message your bot first; your id shows here
 tgmessage allow <your-chat-id>    # chat access
-tgmessage allow sys <your-id>     # + /status, /logs and /cancel_upload
+tgmessage allow sys <your-id>     # + /status, /logs, /cancel_upload, /ai
 tgmessage allow mang <your-id>    # + watcher reports (recommended for you)
 tgmessage shell on                # optional: allow /sh-on root shell for sys chats
 
@@ -45,7 +45,7 @@ opt-in and managed from the CLI (or `/allow` in the UI):
 | command | gives |
 |---|---|
 | `tgmessage allow <id>` | chat, files, history |
-| `tgmessage allow sys <id>` | + `/status`, `/logs`, `/cancel_upload` and the opt-in root shell in Telegram |
+| `tgmessage allow sys <id>` | + `/status`, `/logs`, `/cancel_upload`, `/ai` and the opt-in root shell in Telegram |
 | `tgmessage allow mang <id>` | + watcher reports and `/recover` (manage); `mang` implies `sys` |
 
 Revoke with `tgmessage deny [sys\|mang] <id>`; a plain deny removes everything.
@@ -56,8 +56,8 @@ with `tgmessage shell on` (see [Root shell](#root-shell-opt-in-dangerous)).
 
 ## Telegram chat commands
 
-`/help` works for every allowed chat. `/status`, `/logs`, `/cancel_upload` and
-the root shell need `sys` access; `/recover` needs `mang` access.
+`/help` works for every allowed chat. `/status`, `/logs`, `/cancel_upload`,
+`/ai` and the root shell need `sys` access; `/recover` needs `mang` access.
 
 | command | does |
 |---|---|
@@ -67,6 +67,15 @@ the root shell need `sys` access; `/recover` needs `mang` access.
 | `/recover [unit]` | try hard to start a down watched service (unmask/enable if needed, reset-failed, start, retry); without a unit it recovers every down watched service and appends the last journal lines of any service that stays down |
 | `/sh_on` (`/sh-on`) | open an opt-in root shell in this private chat; every following plain message is run as a command |
 | `/sh_off` (`/sh-off`) | close the root shell and kill a command that is still running |
+| `/ai` | start AI mode: talk to the pi coding harness in the saved working directory |
+| `/ai_exit` (`/ai-exit`) | stop AI mode and close the pi process |
+| `/model` | in AI mode, list models as Telegram buttons |
+| `/thinking` | in AI mode, list reasoning levels as Telegram buttons |
+| `/session` (`/resume`) | in AI mode, list saved pi sessions for the current cd as Telegram buttons and resume one |
+| `/ai-status` | in AI mode, show context usage and input/output/total tokens |
+| `/ai-agent` | show the rules injected into the AI at session start |
+| `/ai-agent-add <text>` | add a persistent rule for this chat |
+| `/ai-agent-remove <n\|text>` | remove a persistent rule by number or text |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
 
@@ -131,6 +140,59 @@ provided service). Output and commands are stored by Telegram and in
 `state/<chatid>.jsonl`, so do not run commands whose output contains secrets
 you do not want in those places. For anything long-running, use `nohup`/tmux
 or a systemd unit instead of keeping a chat shell open.
+
+### AI mode (`/ai`)
+
+`/ai` connects a private sys chat to the [pi](https://github.com/earendil-works/pi)
+coding harness. It starts `pi --mode rpc` in the saved working directory, so
+`cd` from a previous `/sh-on` session is used even after `/sh-off`. `/status`
+always shows that `cd`.
+
+While AI mode is on, normal messages are prompts for pi. Thinking text and
+tool calls are hidden; a `thinking....` message is shown while pi works and
+the assistant's normal reply is sent to the chat. `/model` and `/thinking`
+open inline Telegram buttons, `/session` (also `/resume`) lists saved pi
+sessions for the current cd with buttons and resumes the one you pick, `/new`
+starts a fresh pi session, `/stop` aborts a run, `/compact` compacts context
+and `/pi <text>` sends text or a pi slash command explicitly. `/ai-status`
+shows context usage and token counts. `/status`, `/logs`, `/recover` and
+`/cancel_upload` still run the server commands. `/ai-exit` stops AI mode.
+
+AI conversations are saved as normal pi sessions, so `/session` also shows
+sessions you created in the pi terminal for the same current directory.
+
+### AI rules and Telegram control
+
+`tgmessage.md` is injected into every new pi session with
+`--append-system-prompt`. It tells the AI that it is running in Telegram and
+how to control the response with `<tg>` control blocks. The AI can send plain
+messages, code blocks, raw Telegram HTML, typing actions and inline buttons.
+The AI is also told to send a short status before a big task and short
+progress updates during long work.
+
+```text
+<tg>
+{"actions":[
+  {"type":"status","text":"Running the tests..."},
+  {"type":"code","text":"pytest -q"},
+  {"type":"buttons","text":"Continue?","buttons":[{"label":"Yes","value":"yes"},{"label":"No","value":"no"}]}
+]}
+</tg>
+```
+
+The bot removes the block and executes the actions. A button press sends its
+`value` back to the AI as a new user message.
+
+`/ai-agent` shows the default rules and the custom rules for this chat.
+`/ai-agent-add <text>` appends a custom rule and `/ai-agent-remove <n|text>`
+removes one. Custom rules are saved under `state/ai-agent-<chatid>.json` and
+are injected into every new AI session for that chat. A running session gets
+the change as an immediate rule update message.
+
+`/ai` is refused while a root shell is on; run `/sh-off` first. It only works
+in a private chat with `sys` access. The pi executable is found on `PATH`; set
+`TG_PI_BIN` if it is somewhere else. Optional `TG_AI_MODEL` and `TG_AI_PROVIDER`
+choose the starting model.
 
 ## Local Bot API (large files)
 
@@ -357,12 +419,16 @@ TG_LOCAL_API_JOBS=1         # build jobs (1 = low-end friendly)
 TG_MAX_DOWNLOAD_MB=         # empty = 20 cloud / 2000 local
 TG_MAX_UPLOAD_MB=           # empty = 50 cloud / 2000 local
 TG_ALLOWED_CHAT_IDS=...     # chat access
-TG_SYS_CHAT_IDS=...         # /status, /logs, /cancel_upload + root shell
+TG_SYS_CHAT_IDS=...         # /status, /logs, /cancel_upload, /ai + root shell
 TG_MANG_CHAT_IDS=...        # watcher reports
 TG_SHELL_ENABLED=0          # 1 = allow /sh-on for sys chats (dangerous)
 TG_SHELL_IDLE_SECONDS=600   # close an idle shell after 10m
 TG_SHELL_MAX_SECONDS=1800   # maximum shell lifetime (30m)
 TG_SHELL_TIMEOUT=120        # kill one command after 2m
+TG_AI_ENABLED=1             # 1 = allow /ai for sys chats
+# TG_PI_BIN=/root/.pi/agent/bin/pi
+# TG_AI_MODEL=deepseek-v4.1-flash
+# TG_AI_PROVIDER=opencode-go
 TG_WATCH_SERVICES=...       # services the watcher watches
 TG_SERVICE_NO_RESTART=...   # watched services it should only report (no restart)
 TG_DEFAULT_CHAT=...

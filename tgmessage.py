@@ -22,7 +22,7 @@ A bot can be messaged by many people, but it may only talk to people who are
 allowed. Permission levels are managed in .env by the CLI:
 
     tgmessage allow <id>         chat only (send/receive/files)
-    tgmessage allow sys <id>     + /status, /logs, /cancel_upload and the
+    tgmessage allow sys <id>     + /status, /logs, /cancel_upload, /ai and the
                                  opt-in /sh-on root shell from Telegram
     tgmessage allow mang <id>    + watcher reports and /recover (manage)
     tgmessage deny [sys|mang] <id>
@@ -59,6 +59,7 @@ Everything lives in TG_HOME (default /root/tgmessage):
         <chatid>.jsonl  one history file per allowed chat
         pending.json    chats waiting to be allowed
         chats.json      chat metadata (names, counts, last seen)
+        workspace.json  saved cd, used by /sh-on and /ai
         daemon.log      daemon output
         daemon.pid      pid, only when running without systemd
 
@@ -453,6 +454,11 @@ class Config:
         )
         self.shell_timeout = parse_seconds(
             shell_get("TG_SHELL_TIMEOUT", "120"), 120, 5, 3600)
+        # AI mode: sys chats can talk to the pi coding harness from Telegram.
+        self.ai_enabled = parse_bool(shell_get("TG_AI_ENABLED", "1"))
+        self.pi_bin = get("TG_PI_BIN", "").strip()
+        self.ai_provider = get("TG_AI_PROVIDER", "").strip()
+        self.ai_model = get("TG_AI_MODEL", "").strip()
         self.state_dir = os.path.join(self.home, "state")
         self.files_dir = os.path.abspath(os.path.expanduser(
             get("TG_FILES_DIR") or os.path.join(self.home, "files")))
@@ -618,16 +624,39 @@ class Telegram:
             {
                 "offset": offset,
                 "timeout": self.cfg.poll_timeout,
-                "allowed_updates": json.dumps(["message", "edited_message"]),
+                "allowed_updates": json.dumps(
+                    ["message", "edited_message", "callback_query"]),
             },
             timeout=self.cfg.poll_timeout + 20,
         )
 
-    def send_message(self, chat_id, text, parse_mode=None):
+    def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
         params = {"chat_id": chat_id, "text": text}
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup:
+            params["reply_markup"] = reply_markup
         return self.call("sendMessage", params, timeout=30)
+
+    def edit_message_text(self, chat_id, message_id, text, parse_mode=None,
+                          reply_markup=None):
+        params = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
+        return self.call("editMessageText", params, timeout=30)
+
+    def answer_callback_query(self, callback_query_id, text=None, show_alert=False):
+        params = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text[:200]
+            params["show_alert"] = "true" if show_alert else "false"
+        return self.call("answerCallbackQuery", params, timeout=15)
+
+    def send_chat_action(self, chat_id, action="typing"):
+        return self.call(
+            "sendChatAction", {"chat_id": chat_id, "action": action}, timeout=15)
 
     def send_document(self, chat_id, path, caption=None):
         """Upload a file with sendDocument (multipart/form-data, stdlib only)."""
@@ -1248,6 +1277,840 @@ def run_shell_command(command, cwd, timeout, max_output=SHELL_MAX_OUTPUT,
 
 
 # --------------------------------------------------------------------------
+# working directory shared by /sh-on and /ai
+# --------------------------------------------------------------------------
+
+WORKDIR_FILE = "workspace.json"
+
+
+def default_workdir(cfg):
+    home = os.path.expanduser("~")
+    for path in (home, cfg.home, "/"):
+        if path and os.path.isdir(path):
+            return os.path.abspath(path)
+    return "/"
+
+
+def read_workdir(cfg):
+    """Return the saved cd, falling back to the service home."""
+    path = os.path.join(cfg.state_dir, WORKDIR_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        cwd = str((data or {}).get("cwd") or "").strip()
+        if cwd and os.path.isdir(cwd):
+            return os.path.abspath(cwd)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return default_workdir(cfg)
+
+
+def write_workdir(cfg, cwd):
+    """Remember a cd for the next /sh-on and /ai, even after /sh-off."""
+    if not cwd or not os.path.isdir(cwd):
+        return False
+    path = os.path.join(cfg.state_dir, WORKDIR_FILE)
+    data = {"cwd": os.path.abspath(cwd), "updated": time.time()}
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def find_pi(cfg):
+    """Find the pi executable even when systemd has a small PATH."""
+    candidates = []
+    configured = (getattr(cfg, "pi_bin", "") or "").strip()
+    if configured:
+        expanded = os.path.expanduser(configured)
+        candidates.append(expanded)
+        if not os.path.isabs(expanded):
+            found = shutil.which(expanded)
+            if found:
+                candidates.append(found)
+    found = shutil.which("pi")
+    if found:
+        candidates.append(found)
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, ".pi", "agent", "bin", "pi"),
+        "/root/.pi/agent/bin/pi",
+        "/usr/local/bin/pi",
+    ]
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def pi_missing_text(cfg):
+    """Clear error for /ai when the pi executable is not available."""
+    configured = (getattr(cfg, "pi_bin", "") or "").strip()
+    if configured:
+        first = (
+            f"AI mode unavailable: TG_PI_BIN points to {configured}, "
+            "but that is not an executable file."
+        )
+    else:
+        first = "AI mode unavailable: pi is not installed or not on PATH."
+    return "\n".join([
+        first,
+        "",
+        "Install pi on the server:",
+        "  curl -fsSL https://pi.dev/install.sh | sh",
+        "",
+        "Or set TG_PI_BIN in the .env file to the pi executable,",
+        "then restart tgmessage and send /ai again.",
+    ])
+
+
+# --------------------------------------------------------------------------
+# /ai - talk to the pi coding harness from a private Telegram chat
+# --------------------------------------------------------------------------
+
+AI_MAX_LINE = 4 * 1024 * 1024      # drop oversized protocol records
+AI_COMMAND_TIMEOUT = 20
+AI_START_TIMEOUT = 45
+AI_MODEL_PAGE = 8
+AI_SESSION_PAGE = 8
+AI_SESSION_LIMIT = 120
+AI_SESSION_HEAD = 512 * 1024
+AI_SESSION_TAIL = 256 * 1024
+
+
+def _session_message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "")
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _one_line(text, limit):
+    text = " ".join(str(text or "").split())
+    return text[:limit]
+
+
+def _parse_session_blob(blob, meta):
+    """Pull the latest name and an early user message out of one chunk."""
+    for raw in blob.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw.decode("utf-8", "replace"))
+        except (ValueError, json.JSONDecodeError):
+            continue
+        kind = record.get("type")
+        if kind == "session_info":
+            meta["name"] = str(record.get("name") or "")
+            continue
+        if not meta["first_user"] and kind == "message":
+            message = record.get("message") or {}
+            if message.get("role") == "user":
+                text = _session_message_text(message.get("content"))
+                if text.strip():
+                    meta["first_user"] = _one_line(text, 200)
+
+
+def read_pi_session(path, mtime, want_cwd=None):
+    """Read just enough of a pi session file to show it in the picker."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    meta = {"name": "", "first_user": ""}
+    try:
+        with open(path, "rb") as fh:
+            header_raw = fh.readline(1024 * 1024)
+            try:
+                header = json.loads(header_raw.decode("utf-8", "replace"))
+            except (ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(header, dict) or header.get("type") != "session":
+                return None
+            session_cwd = str(header.get("cwd") or "")
+            if want_cwd and (
+                not session_cwd
+                or os.path.realpath(session_cwd) != os.path.realpath(want_cwd)
+            ):
+                return None
+            _parse_session_blob(fh.read(AI_SESSION_HEAD), meta)
+            start = max(0, size - AI_SESSION_TAIL)
+            if start > fh.tell():
+                fh.seek(start)
+                _parse_session_blob(fh.read(), meta)
+    except OSError:
+        return None
+
+    session_id = str(header.get("id") or "")
+    title = meta["name"] or meta["first_user"] or session_id[:8] or "empty session"
+    return {
+        "path": os.path.abspath(path),
+        "id": session_id,
+        "cwd": session_cwd,
+        "created": str(header.get("timestamp") or ""),
+        "name": meta["name"],
+        "title": _one_line(title, 100),
+        "first_user": meta["first_user"],
+        "mtime": float(mtime or 0),
+    }
+
+
+def discover_pi_sessions(roots, limit=AI_SESSION_LIMIT, cwd=None):
+    """Return the newest pi session files found under the given roots."""
+    found = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.endswith(".jsonl"):
+                    continue
+                path = os.path.join(dirpath, filename)
+                real = os.path.realpath(path)
+                if real in seen:
+                    continue
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                seen.add(real)
+                found.append((stat.st_mtime, path))
+    found.sort(reverse=True)
+    sessions = []
+    for mtime, path in found:
+        record = read_pi_session(path, mtime, want_cwd=cwd)
+        if record:
+            sessions.append(record)
+            if len(sessions) >= limit:
+                break
+    return sessions
+
+
+def _protocol_lines(stream, limit=AI_MAX_LINE):
+    """Yield complete JSONL lines, dropping records larger than limit."""
+    while True:
+        line = stream.readline(limit)
+        if not line:
+            return
+        if not line.endswith(b"\n"):
+            # An oversized record. Drain it so the next record starts cleanly.
+            while True:
+                rest = stream.readline(limit)
+                if not rest:
+                    return
+                if rest.endswith(b"\n"):
+                    break
+            continue
+        yield line.decode("utf-8", "replace")
+
+
+TG_CONTROL_RE = re.compile(r"<tg>\s*(.*?)\s*</tg>", re.IGNORECASE | re.DOTALL)
+TG_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+AI_CONTROL_LIMIT = 20
+AI_BUTTON_LIMIT = 300
+
+
+def tgmessage_prompt_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgmessage.md")
+
+
+def ai_rules_paths(cfg, cid):
+    base = os.path.join(cfg.state_dir, f"ai-agent-{cid}")
+    return base + ".json", base + ".md"
+
+
+def load_ai_rules(cfg, cid):
+    json_path, _md_path = ai_rules_paths(cfg, cid)
+    try:
+        with open(json_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item).strip() for item in data if str(item).strip()]
+
+
+def save_ai_rules(cfg, cid, rules):
+    rules = [str(rule).strip() for rule in rules if str(rule).strip()]
+    json_path, md_path = ai_rules_paths(cfg, cid)
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
+        tmp = json_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(rules, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, json_path)
+    except OSError:
+        return False
+    if not rules:
+        try:
+            os.unlink(md_path)
+        except OSError:
+            pass
+        return True
+    try:
+        tmp = md_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("# Persistent AI agent rules for this Telegram chat\n\n")
+            for rule in rules:
+                fh.write(f"- {rule}\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, md_path)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_ai_rules_file(cfg, cid):
+    rules = load_ai_rules(cfg, cid)
+    _json_path, md_path = ai_rules_paths(cfg, cid)
+    if not rules:
+        try:
+            os.unlink(md_path)
+        except OSError:
+            pass
+        return None
+    if not os.path.isfile(md_path):
+        save_ai_rules(cfg, cid, rules)
+    return md_path if os.path.isfile(md_path) else None
+
+
+def _plain_html(text):
+    return re.sub(r"<[^>]+>", "", str(text or "")).strip()
+
+
+def parse_tg_controls(text):
+    """Split assistant text into visible text and Telegram control actions."""
+    visible = []
+    actions = []
+    errors = 0
+    position = 0
+    text = text or ""
+    fenced = [(match.start(), match.end()) for match in TG_FENCE_RE.finditer(text)]
+    for match in TG_CONTROL_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in fenced):
+            # A control block inside a code fence is an example, not a command.
+            continue
+        visible.append(text[position:match.start()])
+        position = match.end()
+        payload = match.group(1).strip()
+        try:
+            obj = json.loads(payload)
+        except (ValueError, json.JSONDecodeError):
+            errors += 1
+            continue
+        if isinstance(obj, dict):
+            raw = obj.get("actions") if isinstance(obj.get("actions"), list) else [obj]
+        elif isinstance(obj, list):
+            raw = obj
+        else:
+            errors += 1
+            continue
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("type"):
+                errors += 1
+                continue
+            if len(actions) >= AI_CONTROL_LIMIT:
+                errors += 1
+                break
+            actions.append(item)
+    visible.append(text[position:])
+    return "".join(visible).strip(), actions, errors
+
+
+class AiSession:
+    """One long-lived `pi --mode rpc` process for one Telegram chat."""
+
+    def __init__(self, daemon, cid, cwd):
+        self.daemon = daemon
+        self.cfg = daemon.cfg
+        self.cid = cid
+        self.cwd = cwd
+        self.started = time.time()
+        self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending = {}
+        self.seq = 0
+        self.closed = False
+        self.dead = False
+        self.busy = False
+        self.thinking_shown = False
+        self.extension_notice = False
+        self.models = []
+        self.model_page = 0
+        self.model_message_id = None
+        self.current_model = {}
+        self.think_levels = []
+        self.current_thinking = ""
+        self.current_session_file = ""
+        self.current_session_id = ""
+        self.current_session_name = ""
+        self.message_count = 0
+        self.session_list = []
+        self.session_page = 0
+        self.session_message_id = None
+        self.button_seq = 0
+        self.buttons = {}
+        self.text_seq = 0
+        self.processed_text = set()
+        self.visible_text_sent = False
+        self.rules_paths = []
+        self.proc = None
+
+        pi = find_pi(self.cfg)
+        if not pi:
+            raise RuntimeError(pi_missing_text(self.cfg))
+        self.pi = pi
+        self._spawn()
+
+    def _spawn(self):
+        args = [
+            self.pi,
+            "--mode", "rpc",
+        ]
+        provider = (getattr(self.cfg, "ai_provider", "") or "").strip()
+        model = (getattr(self.cfg, "ai_model", "") or "").strip()
+        if model:
+            if provider:
+                args += ["--provider", provider]
+            args += ["--model", model]
+
+        default_rules = tgmessage_prompt_path()
+        if os.path.isfile(default_rules):
+            self.rules_paths.append(default_rules)
+            args += ["--append-system-prompt", default_rules]
+        else:
+            log(self.cfg, f"ai: missing {default_rules} - Telegram rules not injected")
+        custom_rules = ensure_ai_rules_file(self.cfg, self.cid)
+        if custom_rules:
+            self.rules_paths.append(custom_rules)
+            args += ["--append-system-prompt", custom_rules]
+
+        env = os.environ.copy()
+        pi_dir = os.path.dirname(self.pi)
+        path = env.get("PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        if pi_dir and pi_dir not in path.split(os.pathsep):
+            path = pi_dir + os.pathsep + path
+        env["PATH"] = path
+        env.setdefault("HOME", os.path.expanduser("~"))
+        env["TERM"] = "dumb"
+        env["NO_COLOR"] = "1"
+
+        self.proc = subprocess.Popen(
+            args,
+            cwd=self.cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=True,
+        )
+        threading.Thread(target=self._read_loop, daemon=True).start()
+        threading.Thread(target=self._stderr_loop, daemon=True).start()
+        log(self.cfg, f"/ai started pi for chat {self.cid} in {self.cwd}")
+
+    @property
+    def alive(self):
+        with self.lock:
+            return not (self.closed or self.dead)
+
+    @property
+    def working(self):
+        with self.lock:
+            return self.busy and not self.closed and not self.dead
+
+    def _write(self, payload):
+        line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            with self.write_lock:
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def command(self, cmd_type, timeout=AI_COMMAND_TIMEOUT, **fields):
+        """Send one RPC command and wait for its matching response."""
+        with self.lock:
+            if self.closed or self.dead:
+                return None, "AI mode is not running"
+            self.seq += 1
+            rid = f"tg{self.cid}-{self.seq}"
+        item = {"event": threading.Event(), "response": None}
+        with self.pending_lock:
+            self.pending[rid] = item
+        if not self._write({"id": rid, "type": cmd_type, **fields}):
+            with self.pending_lock:
+                self.pending.pop(rid, None)
+            return None, "pi is not accepting input"
+        if not item["event"].wait(timeout):
+            with self.pending_lock:
+                self.pending.pop(rid, None)
+            return None, f"pi did not answer in {int(timeout)}s"
+        response = item["response"] or {}
+        if not response.get("success"):
+            return None, response.get("error") or "pi command failed"
+        return response.get("data"), None
+
+    def prompt(self, text):
+        with self.lock:
+            busy = self.busy
+            dead = self.closed or self.dead
+        if dead:
+            return None, "AI mode is not running"
+        fields = {"message": text}
+        if busy:
+            fields["streamingBehavior"] = "followUp"
+        return self.command("prompt", timeout=15, **fields)
+
+    def apply_state(self, state):
+        """Refresh model, thinking and session details from get_state."""
+        if not state:
+            return
+        self.current_model = state.get("model") or self.current_model
+        if state.get("thinkingLevel") is not None:
+            self.current_thinking = str(state.get("thinkingLevel") or "")
+        if state.get("sessionFile"):
+            self.current_session_file = str(state["sessionFile"])
+        if state.get("sessionId"):
+            self.current_session_id = str(state["sessionId"])
+        if "sessionName" in state:
+            self.current_session_name = str(state.get("sessionName") or "")
+        try:
+            self.message_count = int(state.get("messageCount") or 0)
+        except (TypeError, ValueError):
+            self.message_count = 0
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            proc = self.proc
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                kill_process_group(proc)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        log(self.cfg, f"/ai stopped pi for chat {self.cid}")
+
+    def _read_loop(self):
+        try:
+            for raw in _protocol_lines(self.proc.stdout):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                self._dispatch(record)
+        except Exception as exc:  # noqa: BLE001 - the reader must not crash silently
+            log(self.cfg, f"ai reader for {self.cid} failed: {exc!r}")
+        finally:
+            with self.lock:
+                was_closed = self.closed
+                self.dead = True
+                self.busy = False
+            with self.pending_lock:
+                waiting = list(self.pending.values())
+                self.pending.clear()
+            for item in waiting:
+                item["response"] = {"success": False, "error": "pi exited"}
+                item["event"].set()
+            if not was_closed:
+                with self.lock:
+                    notify = not self.closed
+                if notify:
+                    try:
+                        self.daemon._record_out(
+                            self.cid,
+                            "AI stopped: the pi process exited.\n"
+                            "Send /ai-exit, then /ai to start a new one.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    def _stderr_loop(self):
+        count = 0
+        try:
+            for raw in self.proc.stderr:
+                text = raw.decode("utf-8", "replace").strip()
+                if not text:
+                    continue
+                count += 1
+                if count <= 20 or count % 100 == 0:
+                    log(self.cfg, f"ai[{self.cid}] stderr: {text[:500]}")
+        except (OSError, ValueError):
+            pass
+
+    def _dispatch(self, record):
+        kind = record.get("type")
+        if kind == "response":
+            rid = record.get("id")
+            if not rid:
+                return
+            with self.pending_lock:
+                item = self.pending.pop(rid, None)
+            if item is not None:
+                item["response"] = record
+                item["event"].set()
+            return
+        if kind == "extension_ui_request":
+            self._extension_ui(record)
+            return
+        if kind == "agent_start":
+            with self.lock:
+                self.busy = True
+                self.thinking_shown = False
+            self._show_thinking()
+            return
+        if kind == "message_start":
+            message = record.get("message") or {}
+            if message.get("role") == "assistant":
+                self.text_seq += 1
+                self.processed_text = set()
+                self.visible_text_sent = False
+            return
+        if kind == "message_update":
+            event = record.get("assistantMessageEvent") or {}
+            event_type = event.get("type")
+            if event_type in ("thinking_start", "toolcall_start"):
+                self._show_thinking()
+            elif event_type == "text_end":
+                content = event.get("content")
+                if isinstance(content, str):
+                    key = (self.text_seq, event.get("contentIndex"))
+                    if key not in self.processed_text:
+                        self.processed_text.add(key)
+                        self._handle_text(content)
+            return
+        if kind == "message_end":
+            self._message_end(record.get("message") or {})
+            return
+        if kind == "agent_settled":
+            with self.lock:
+                self.busy = False
+
+    def _extension_ui(self, record):
+        method = record.get("method")
+        if method in ("select", "confirm", "input", "editor"):
+            self._write({
+                "type": "extension_ui_response",
+                "id": record.get("id"),
+                "cancelled": True,
+            })
+            with self.lock:
+                show = not self.extension_notice
+                self.extension_notice = True
+            if show:
+                self.daemon._record_out(
+                    self.cid,
+                    "An extension asked for input. Dialogs are not available "
+                    "in Telegram AI mode.",
+                )
+            return
+        if method == "notify":
+            message = str(record.get("message") or "").strip()
+            if message:
+                log(self.cfg, f"ai[{self.cid}] notify: {message[:500]}")
+
+    def _show_thinking(self):
+        with self.lock:
+            if self.thinking_shown:
+                return
+            self.thinking_shown = True
+        self.daemon._record_out(self.cid, "thinking....")
+
+    def _message_end(self, message):
+        if message.get("role") != "assistant":
+            return
+        for index, block in enumerate(message.get("content") or []):
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            text = str(block.get("text") or "").strip()
+            if not text:
+                continue
+            key = (self.text_seq, index)
+            if key in self.processed_text:
+                continue
+            self.processed_text.add(key)
+            self._handle_text(text)
+        if message.get("stopReason") == "error" and not self.visible_text_sent:
+            error = str(message.get("errorMessage") or "provider error").strip()
+            self.daemon._record_out(self.cid, f"AI error: {error}")
+            self.visible_text_sent = True
+
+    def _send_text(self, text):
+        for chunk in split_message(text, 3500):
+            self.daemon._record_out(self.cid, chunk)
+
+    def _handle_text(self, text):
+        clean, actions, errors = parse_tg_controls(text)
+        if errors:
+            log(self.cfg, f"ai[{self.cid}]: {errors} invalid Telegram control action(s)")
+        visible = False
+        for action in actions:
+            try:
+                if self._run_tg_action(action):
+                    visible = True
+            except Exception as exc:  # noqa: BLE001 - one bad action must not stop the reply
+                log(self.cfg, f"ai[{self.cid}]: control action failed: {exc!r}")
+        if clean:
+            self._send_text(clean)
+            visible = True
+        if visible:
+            self.visible_text_sent = True
+        return visible
+
+    def _run_tg_action(self, action):
+        kind = str(action.get("type") or "").strip().lower()
+        if kind in ("message", "status", "text"):
+            text = str(action.get("text") or action.get("message") or "").strip()
+            if not text:
+                return False
+            self._send_text(text)
+            return True
+        if kind == "code":
+            text = str(action.get("text") or action.get("message") or "").strip()
+            if not text:
+                return False
+            for chunk in split_message(text, 3500):
+                self.daemon._record_out(
+                    self.cid,
+                    telegram_code_block(chunk),
+                    parse_mode="HTML",
+                    history_text=chunk,
+                )
+            return True
+        if kind == "html":
+            text = str(action.get("text") or action.get("html") or "").strip()
+            if not text:
+                return False
+            for chunk in split_message(text, 3500):
+                result = self.daemon._record_out(
+                    self.cid,
+                    chunk,
+                    parse_mode="HTML",
+                    history_text=_plain_html(chunk),
+                )
+                if result is None:
+                    self.daemon._record_out(self.cid, _plain_html(chunk))
+            return True
+        if kind == "buttons":
+            return self._send_tg_buttons(action)
+        if kind == "typing":
+            try:
+                self.daemon.tg.send_chat_action(
+                    self.cid, str(action.get("action") or "typing"))
+            except TelegramError as exc:
+                log(self.cfg, f"ai[{self.cid}]: sendChatAction failed: {exc}")
+            return False
+        log(self.cfg, f"ai[{self.cid}]: unknown control action {kind!r}")
+        return False
+
+    def _button_parts(self, item):
+        if isinstance(item, dict):
+            label = item.get("label") or item.get("text") or item.get("value") or ""
+            value = item.get("value", label)
+        elif isinstance(item, (list, tuple)):
+            label = item[0] if item else ""
+            value = item[1] if len(item) > 1 else label
+        else:
+            label = item
+            value = item
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        label = _one_line(label, 60)
+        return label, value
+
+    def _send_tg_buttons(self, action):
+        text = str(action.get("text") or action.get("message") or "Choose:").strip()
+        raw_rows = action.get("rows")
+        if not isinstance(raw_rows, list):
+            raw_buttons = action.get("buttons")
+            if isinstance(raw_buttons, list):
+                if any(isinstance(item, (list, tuple)) for item in raw_buttons):
+                    raw_rows = raw_buttons
+                else:
+                    raw_rows = [[item] for item in raw_buttons]
+            else:
+                raw_rows = []
+
+        rows = []
+        count = 0
+        for raw_row in raw_rows[:8]:
+            if not isinstance(raw_row, (list, tuple)):
+                raw_row = [raw_row]
+            row = []
+            for item in raw_row[:3]:
+                if count >= 24:
+                    break
+                label, value = self._button_parts(item)
+                if not label:
+                    continue
+                key = f"b{self.button_seq}"
+                self.button_seq += 1
+                self.buttons[key] = {
+                    "label": label,
+                    "value": value,
+                    "text": text[:3500],
+                }
+                row.append({"text": label, "callback_data": f"aitg:{key}"})
+                count += 1
+            if row:
+                rows.append(row)
+        while len(self.buttons) > AI_BUTTON_LIMIT:
+            self.buttons.pop(next(iter(self.buttons)))
+
+        chunks = split_message(text, 3500)
+        markup = json.dumps({"inline_keyboard": rows}) if rows else None
+        for index, chunk in enumerate(chunks):
+            self.daemon._record_out(
+                self.cid,
+                chunk,
+                reply_markup=markup if index == len(chunks) - 1 else None,
+            )
+        return True
+
+
+# --------------------------------------------------------------------------
 # live system status for the /status chat command
 # --------------------------------------------------------------------------
 
@@ -1755,6 +2618,7 @@ def status_services(units):
 def system_status_text(cfg):
     """The text the Telegram /status command replies with."""
     lines = [f"\U0001F4CA status - {socket.gethostname()}"]
+    lines.append(f"cd: {read_workdir(cfg)}")
     line = f"uptime: {status_uptime()}"
     try:
         l1, l5, l15 = os.getloadavg()
@@ -2096,6 +2960,24 @@ def chat_help_text(cfg, is_sys=False, is_mang=False):
             "/logs   - last 40 lines of the watcher system log (/logs 100 for more)",
             "/cancel_upload <id> - stop an active upload listed by /status",
         ]
+        if getattr(cfg, "ai_enabled", False):
+            lines += [
+                "/ai     - start AI mode: talk to the pi coding harness here",
+                "/ai_exit - quit AI mode (/ai-exit also works)",
+                "          (uses the saved cd; inside AI mode /model picks",
+                "          a model with buttons, /thinking picks the level,",
+                "          /session resumes a saved pi session, and /new,",
+                "          /stop, /compact and /pi <text> also work)",
+                "/ai-status - AI context, tokens out and total token usage",
+                "/ai-agent  - show the rules injected into the AI",
+                "/ai-agent-add <text> - add a persistent AI rule",
+                "/ai-agent-remove <n|text> - remove an AI rule",
+            ]
+        else:
+            lines += [
+                "/ai - AI mode is disabled on this host",
+                "          owner can enable it with TG_AI_ENABLED=1",
+            ]
         if getattr(cfg, "shell_enabled", False):
             lines += [
                 "/sh_on  - open a root shell in this private chat (dangerous)",
@@ -2120,7 +3002,7 @@ def chat_help_text(cfg, is_sys=False, is_mang=False):
             ]
     else:
         lines += [
-            "/status, /logs, /cancel_upload and the /sh_on root shell need sys access -",
+            "/status, /logs, /cancel_upload, /ai and the /sh_on root shell need sys access -",
             "ask the bot owner to run: tgmessage allow sys <your-chat-id>",
         ]
     lines += [
@@ -2152,6 +3034,15 @@ BOT_COMMANDS = [
     ("recover", "Recover down watched services"),
     ("sh_on", "Open the root shell in this private chat"),
     ("sh_off", "Close the root shell"),
+    ("ai", "Start AI mode (pi coding harness)"),
+    ("ai_exit", "Stop AI mode"),
+    ("model", "Pick an AI model (AI mode)"),
+    ("thinking", "Pick a thinking level (AI mode)"),
+    ("session", "Resume a pi session (AI mode)"),
+    ("ai_status", "Show AI context and token usage (AI mode)"),
+    ("ai_agent", "Show the AI agent rules"),
+    ("ai_agent_add", "Add an AI agent rule"),
+    ("ai_agent_remove", "Remove an AI agent rule"),
 ]
 
 
@@ -2198,6 +3089,10 @@ class Daemon:
         self.shell_sessions = {}
         self.shell_lock = threading.Lock()
         self.shell_slots = threading.Semaphore(SHELL_MAX_CONCURRENT)
+        # /ai processes are memory only: /ai-exit, a daemon restart or a
+        # permission change stops them.
+        self.ai_sessions = {}
+        self.ai_lock = threading.Lock()
         self._load_shell_state()
 
     # ---- state -------------------------------------------------------
@@ -2292,6 +3187,21 @@ class Daemon:
         )
         self.cfg.shell_timeout = parse_seconds(
             setting("TG_SHELL_TIMEOUT", "120"), 120, 5, 3600)
+        self.cfg.ai_enabled = parse_bool(setting("TG_AI_ENABLED", "1"))
+        self.cfg.pi_bin = setting("TG_PI_BIN", "").strip()
+        self.cfg.ai_provider = setting("TG_AI_PROVIDER", "").strip()
+        self.cfg.ai_model = setting("TG_AI_MODEL", "").strip()
+
+        # Turning AI mode off, or revoking sys from a chat, stops its pi process.
+        with self.ai_lock:
+            ai_dropped = []
+            for cid, session in list(self.ai_sessions.items()):
+                if not self.cfg.ai_enabled or cid not in self.sys:
+                    ai_dropped.append(self.ai_sessions.pop(cid))
+        for session in ai_dropped:
+            session.close()
+        if ai_dropped:
+            log(self.cfg, f"AI mode: stopped {len(ai_dropped)} session(s) after a permission/config change")
 
         # Turning the feature off, or revoking sys from a chat, closes live
         # shells immediately (including any command still running).
@@ -2487,6 +3397,10 @@ class Daemon:
             time.sleep(0.2)
 
     def handle_update(self, update):
+        callback = update.get("callback_query")
+        if callback:
+            self.handle_callback_query(callback)
+            return
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             return
@@ -2536,19 +3450,25 @@ class Daemon:
         """Handle /commands typed in the Telegram chat itself.
 
         When a /sh-on session is active, plain messages are shell commands.
-        Bot commands keep working; /sh-off always closes the shell.  Edited
-        messages are never executed, so editing an old command cannot run it
-        twice.
+        When an /ai session is active, plain messages are prompts for pi.
+        Bot commands keep working; /sh-off and /ai-exit always close their
+        session.  Edited messages are never executed, so editing an old
+        command cannot run it twice.
         """
         cmd = (text or "").strip()
         if not cmd:
             return
         if not cmd.startswith("/"):
+            if self._ai_active(cid):
+                self._ai_prompt_async(cid, cmd, edited)
+                return
             self._maybe_shell_input(cid, cmd, chat_type, edited)
             return
         head = cmd.split()[0].lower()
         if "@" in head:  # /status@thebot in group chats
             head = head.split("@", 1)[0]
+        if self._ai_mode_take(cid, cmd, head, chat_type, edited):
+            return
         if self._shell_mode_take(cid, cmd, head, chat_type, edited):
             return
         if head == "/status":
@@ -2595,10 +3515,42 @@ class Daemon:
             threading.Thread(target=self._chat_shell_on_reply, args=(cid, chat_type), daemon=True).start()
         elif head in ("/sh-off", "/sh_off"):
             threading.Thread(target=self._chat_shell_off_reply, args=(cid,), daemon=True).start()
+        elif head in ("/ai",):
+            threading.Thread(target=self._chat_ai_on_reply, args=(cid, chat_type), daemon=True).start()
+        elif head in ("/ai-exit", "/ai_exit"):
+            self._record_out(cid, "AI mode is already OFF.")
+        elif head == "/model":
+            self._record_out(cid, "The model picker only works in AI mode. Send /ai first.")
+        elif head in ("/session", "/sessions", "/resume"):
+            self._record_out(cid, "The session picker only works in AI mode. Send /ai first.")
+        elif head in ("/ai-status", "/ai_status"):
+            self._record_out(cid, "AI mode is OFF - send /ai first.")
+        elif head in ("/ai-agent", "/ai_agent"):
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/ai-agent", "sys"), daemon=True).start()
+            else:
+                threading.Thread(target=self._chat_ai_agent_reply, args=(cid,), daemon=True).start()
+        elif head in ("/ai-agent-add", "/ai_agent_add"):
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/ai-agent-add", "sys"), daemon=True).start()
+                return
+            parts = cmd.split(None, 1)
+            rule = parts[1].strip() if len(parts) > 1 else ""
+            threading.Thread(target=self._chat_ai_agent_add_reply, args=(cid, rule), daemon=True).start()
+        elif head in ("/ai-agent-remove", "/ai_agent_remove"):
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/ai-agent-remove", "sys"), daemon=True).start()
+                return
+            parts = cmd.split(None, 1)
+            rule = parts[1].strip() if len(parts) > 1 else ""
+            threading.Thread(target=self._chat_ai_agent_remove_reply, args=(cid, rule), daemon=True).start()
+        elif head in ("/thinking", "/think"):
+            self._record_out(cid, "The thinking picker only works in AI mode. Send /ai first.")
         elif head in ("/help", "/start", "/commands"):
             threading.Thread(target=self._chat_help_reply, args=(cid,), daemon=True).start()
 
-    def _record_out(self, cid, text, send=True, parse_mode=None, history_text=None):
+    def _record_out(self, cid, text, send=True, parse_mode=None, history_text=None,
+                    reply_markup=None):
         """Record an outgoing message; optionally deliver it to Telegram first.
 
         `text` is what Telegram receives (possibly HTML), while `history_text`
@@ -2607,7 +3559,8 @@ class Daemon:
         result = None
         if send:
             try:
-                result = self.tg.send_message(cid, text, parse_mode=parse_mode)
+                result = self.tg.send_message(
+                    cid, text, parse_mode=parse_mode, reply_markup=reply_markup)
             except TelegramError as exc:
                 log(self.cfg, f"reply to {cid} failed: {exc}")
         rec = {
@@ -2620,6 +3573,7 @@ class Daemon:
         self.history.append(cid, rec)
         self.registry.touch(cid, {}, "out")
         self.broadcast({"type": "msg", **rec})
+        return result
 
     def _chat_denied_reply(self, cid, command, level):
         log(self.cfg, f"{command} denied for chat {cid} (needs {level} access)")
@@ -2636,6 +3590,15 @@ class Daemon:
         except Exception as exc:  # noqa: BLE001
             log(self.cfg, f"/status failed: {exc!r}")
             text = f"status error: {exc!r}"
+        session = self._ai_session(cid)
+        if session is not None:
+            model = session.current_model or {}
+            name = model.get("id") or "default"
+            provider = model.get("provider") or ""
+            if provider:
+                name = f"{provider}/{name}"
+            state = "working" if session.working else "idle"
+            text += f"\n\nAI: ON ({state})  |  model {name}"
         self._record_out(cid, text)
 
     def _chat_logs_reply(self, cid, lines=40):
@@ -2729,6 +3692,940 @@ class Daemon:
             text = text[:3800].rstrip() + "\n… (report trimmed)"
         self._record_out(cid, text)
 
+    # ---- /ai: private pi harness in a private chat --------------------
+    def _ai_session(self, cid):
+        with self.ai_lock:
+            return self.ai_sessions.get(cid)
+
+    def _ai_take(self, cid):
+        with self.ai_lock:
+            return self.ai_sessions.pop(cid, None)
+
+    def _ai_active(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            return False
+        if not session.alive:
+            session = self._ai_take(cid)
+            if session is not None:
+                session.close()
+            return False
+        return True
+
+    def _ai_mode_take(self, cid, cmd, head, chat_type, edited):
+        """Return True when an active /ai session owns this message."""
+        session = self._ai_session(cid)
+        if session is None:
+            return False
+        if not session.alive:
+            self._ai_take(cid)
+            session.close()
+            if head == "/ai":
+                return False
+            self._record_out(cid, "AI mode is OFF: pi stopped. Send /ai to start it again.")
+            return True
+        if edited:
+            self._record_out(cid, "AI: edited messages are ignored - send the message again.")
+            return True
+        if head in ("/ai-exit", "/ai_exit"):
+            threading.Thread(target=self._chat_ai_exit_reply, args=(cid,), daemon=True).start()
+            return True
+        if head == "/ai":
+            self._record_out(
+                cid,
+                f"AI mode is already ON.\ncd: {session.cwd}\n"
+                "Send /ai-exit to stop it.",
+            )
+            return True
+        if head in ("/sh-on", "/sh_on", "/sh-off", "/sh_off"):
+            self._record_out(
+                cid, "AI mode is ON - send /ai-exit before using the root shell.")
+            return True
+        if head == "/model":
+            threading.Thread(target=self._chat_ai_model_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/session", "/sessions", "/resume"):
+            threading.Thread(target=self._chat_ai_sessions_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/ai-status", "/ai_status"):
+            threading.Thread(target=self._chat_ai_status_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/ai-agent", "/ai_agent"):
+            threading.Thread(target=self._chat_ai_agent_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/ai-agent-add", "/ai_agent_add"):
+            parts = cmd.split(None, 1)
+            rule = parts[1].strip() if len(parts) > 1 else ""
+            threading.Thread(
+                target=self._chat_ai_agent_add_reply, args=(cid, rule), daemon=True).start()
+            return True
+        if head in ("/ai-agent-remove", "/ai_agent_remove"):
+            parts = cmd.split(None, 1)
+            rule = parts[1].strip() if len(parts) > 1 else ""
+            threading.Thread(
+                target=self._chat_ai_agent_remove_reply, args=(cid, rule), daemon=True).start()
+            return True
+        if head in ("/thinking", "/think"):
+            threading.Thread(target=self._chat_ai_thinking_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/new", "/new_session"):
+            threading.Thread(target=self._chat_ai_new_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/stop", "/abort"):
+            threading.Thread(target=self._chat_ai_stop_reply, args=(cid,), daemon=True).start()
+            return True
+        if head == "/compact":
+            threading.Thread(target=self._chat_ai_compact_reply, args=(cid,), daemon=True).start()
+            return True
+        if head == "/pi":
+            text = cmd[3:].strip()
+            if not text:
+                self._record_out(cid, "usage: /pi <message or pi slash command>")
+            elif text.startswith("/"):
+                sub = text.split()[0].lower()
+                if "@" in sub:
+                    sub = sub.split("@", 1)[0]
+                if sub in ("/model", "/thinking", "/think", "/new",
+                           "/new_session", "/session", "/sessions", "/resume",
+                           "/ai-status", "/ai_status", "/ai-agent", "/ai_agent",
+                           "/ai-agent-add", "/ai_agent_add",
+                           "/ai-agent-remove", "/ai_agent_remove",
+                           "/stop", "/abort", "/compact",
+                           "/help", "/start", "/commands"):
+                    self._ai_mode_take(cid, text, sub, chat_type, edited)
+                else:
+                    self._ai_prompt_async(cid, text, edited)
+            else:
+                self._ai_prompt_async(cid, text, edited)
+            return True
+        if head in ("/help", "/start", "/commands"):
+            threading.Thread(target=self._chat_ai_help_reply, args=(cid,), daemon=True).start()
+            return True
+        if head in ("/status", "/logs", "/cancel_upload", "/recover"):
+            return False
+        # Every other slash command belongs to pi: extension commands,
+        # prompt templates and skills all run through a normal prompt.
+        self._ai_prompt_async(cid, cmd, edited)
+        return True
+
+    def _ai_prompt_async(self, cid, text, edited=False):
+        if edited:
+            self._record_out(cid, "AI: edited messages are ignored - send the message again.")
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        if self._ai_session(cid) is None:
+            return
+        threading.Thread(target=self._chat_ai_prompt, args=(cid, text), daemon=True).start()
+
+    def _chat_ai_prompt(self, cid, text):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        data, error = session.prompt(text)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+            return
+        if (data or {}).get("disposition") == "queued":
+            self._record_out(cid, "queued - pi will read this after the current turn.")
+        shown = text if len(text) <= 200 else text[:200] + "..."
+        log(self.cfg, f"ai {cid}: {shown!r}")
+
+    def _chat_ai_on_reply(self, cid, chat_type=""):
+        if not self.cfg.ai_enabled:
+            self._record_out(
+                cid,
+                "AI mode is disabled on this host.\n"
+                "Bot owner can enable it with TG_AI_ENABLED=1 in the .env file.",
+            )
+            return
+        if not self.can_sys(cid):
+            self._chat_denied_reply(cid, "/ai", "sys")
+            return
+        if not self._shell_private(cid, chat_type):
+            self._record_out(cid, "refused: AI mode only works in a private chat.")
+            return
+        with self.shell_lock:
+            shell_on = cid in self.shell_sessions
+        if shell_on:
+            self._record_out(
+                cid,
+                "root shell is ON - send /sh-off before starting AI mode.",
+            )
+            return
+        if self._ai_session(cid) is not None:
+            self._record_out(cid, "AI mode is already ON.")
+            return
+        if not find_pi(self.cfg):
+            log(self.cfg, f"/ai unavailable for {cid}: pi executable not found")
+            self._record_out(cid, pi_missing_text(self.cfg))
+            return
+
+        cwd = read_workdir(self.cfg)
+        if not os.path.isdir(cwd):
+            cwd = default_workdir(self.cfg)
+        try:
+            session = AiSession(self, cid, cwd)
+        except Exception as exc:  # noqa: BLE001
+            log(self.cfg, f"/ai start failed for {cid}: {exc!r}")
+            message = str(exc)
+            if "AI mode unavailable" in message:
+                self._record_out(cid, message)
+            else:
+                self._record_out(cid, f"could not start AI mode: {exc}")
+            return
+        with self.ai_lock:
+            if cid in self.ai_sessions:
+                session.close()
+                self._record_out(cid, "AI mode is already ON.")
+                return
+            self.ai_sessions[cid] = session
+
+        state, _error = session.command("get_state", timeout=AI_START_TIMEOUT)
+        session.apply_state(state)
+        model = session.current_model or {}
+        model_name = model.get("id") or "default"
+        if model.get("provider"):
+            model_name = f"{model.get('provider')}/{model_name}"
+        thinking = session.current_thinking
+        lines = [
+            "\U0001F916 AI mode ON - pi harness connected.",
+            f"cd: {cwd}",
+            f"pi: {session.pi}",
+            f"model: {model_name}" + (f"  |  thinking {thinking}" if thinking else ""),
+            "",
+            "Send normal messages here. Thinking and tool calls stay hidden.",
+            "/model - pick a model with buttons",
+            "/thinking - pick the reasoning level with buttons",
+            "/session - resume a saved pi session",
+            "/ai-status - token and context usage | /ai-agent - injected rules",
+            "/new - start a fresh pi session | /stop - abort | /compact - compact context",
+            "/pi <text> - send text or a pi command explicitly",
+            "/status, /logs, /recover still run the server commands",
+            "/ai-exit stops AI mode (also /ai_exit).",
+        ]
+        self._record_out(cid, "\n".join(lines))
+        log(self.cfg, f"/ai ON for chat {cid} in {cwd} (model {model_name})")
+
+    def _chat_ai_exit_reply(self, cid):
+        session = self._ai_take(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is already OFF.")
+            return
+        session.close()
+        self._record_out(
+            cid,
+            f"AI mode OFF. pi stopped.\ncd saved: {read_workdir(self.cfg)}",
+        )
+
+    def _chat_ai_help_reply(self, cid):
+        self._record_out(
+            cid,
+            "AI mode (pi harness):\n"
+            "  /model       pick a model from buttons\n"
+            "  /thinking    pick the reasoning level from buttons\n"
+            "  /session     resume a saved pi session from buttons\n"
+            "  /ai-status   show context usage and token counts\n"
+            "  /ai-agent    show the injected AI rules\n"
+            "  /ai-agent-add <text> - add a persistent rule\n"
+            "  /ai-agent-remove <n|text> - remove a rule\n"
+            "  /new         start a fresh pi session\n"
+            "  /stop        abort the current run\n"
+            "  /compact     compact the conversation context\n"
+            "  /pi <text>   send text or a pi slash command explicitly\n"
+            "  /status, /logs, /recover, /cancel_upload - server commands\n"
+            "  /ai-exit     leave AI mode (also /ai_exit)\n"
+            "Plain messages go to pi. Thinking text and tool calls are hidden.",
+        )
+
+    def _chat_ai_new_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        data, error = session.command("new_session", timeout=30)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+            return
+        if (data or {}).get("cancelled"):
+            self._record_out(cid, "the new session was cancelled by an extension.")
+            return
+        state, _error = session.command("get_state", timeout=15)
+        session.apply_state(state)
+        session.buttons.clear()
+        self._record_out(cid, "new pi session started.")
+        log(self.cfg, f"ai {cid}: new session")
+
+    def _chat_ai_stop_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        self._record_out(cid, "stopping....")
+        _data, error = session.command("abort", timeout=30)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+
+    def _chat_ai_compact_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        self._record_out(cid, "compacting context....")
+        data, error = session.command("compact", timeout=600)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+            return
+        before = (data or {}).get("tokensBefore")
+        after = (data or {}).get("estimatedTokensAfter")
+        note = "context compacted."
+        if before or after:
+            note += f"\ntokens: {before or '?'} -> {after or '?'}"
+        self._record_out(cid, note)
+
+    def _pi_session_roots(self, session):
+        roots = []
+        env = (os.environ.get("PI_CODING_AGENT_SESSION_DIR") or "").strip()
+        if env:
+            roots.append(os.path.expanduser(env))
+        else:
+            home = os.path.expanduser("~")
+            settings_path = os.path.join(home, ".pi", "agent", "settings.json")
+            configured = ""
+            try:
+                with open(settings_path, encoding="utf-8") as fh:
+                    configured = str((json.load(fh) or {}).get("sessionDir") or "").strip()
+            except (OSError, ValueError, json.JSONDecodeError):
+                configured = ""
+            if configured:
+                configured = os.path.expanduser(configured)
+                if not os.path.isabs(configured):
+                    configured = os.path.abspath(os.path.join(session.cwd, configured))
+                roots.append(configured)
+            roots.append(os.path.join(home, ".pi", "agent", "sessions"))
+
+        current_dir = os.path.dirname(session.current_session_file or "")
+        if current_dir and os.path.isdir(current_dir):
+            real_current = os.path.realpath(current_dir)
+            covered = False
+            for root in roots:
+                real_root = os.path.realpath(root)
+                if real_current == real_root or real_current.startswith(real_root + os.sep):
+                    covered = True
+                    break
+            if not covered:
+                roots.append(current_dir)
+
+        out = []
+        seen = set()
+        for root in roots:
+            real = os.path.realpath(root)
+            if real in seen:
+                continue
+            seen.add(real)
+            out.append(root)
+        return out
+
+    def _chat_ai_sessions_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        log(self.cfg, f"ai {cid}: /session picker")
+        try:
+            sessions = discover_pi_sessions(
+                self._pi_session_roots(session), cwd=session.cwd)
+        except Exception as exc:  # noqa: BLE001
+            log(self.cfg, f"ai {cid}: session scan failed: {exc!r}")
+            self._record_out(cid, f"could not read pi sessions: {exc}")
+            return
+        session.session_list = sessions
+        session.session_page = 0
+        self._ai_send_session_page(session, 0)
+
+    def _ai_session_label(self, record):
+        title = _one_line(record.get("title") or "empty session", 42)
+        if len(record.get("title") or "") > 42:
+            title = title[:41].rstrip() + "…"
+        when = time.strftime("%m-%d %H:%M", time.localtime(record.get("mtime") or 0))
+        return f"{title} · {when}"[:58]
+
+    def _ai_current_session_title(self, session):
+        current = session.current_session_file or ""
+        if current:
+            real_current = os.path.realpath(current)
+            for record in session.session_list:
+                if os.path.realpath(record["path"]) == real_current:
+                    return record["title"]
+        return session.current_session_name or "new session"
+
+    def _ai_send_session_page(self, session, page, edit_id=None):
+        cid = session.cid
+        sessions = session.session_list
+        total = max(1, (len(sessions) + AI_SESSION_PAGE - 1) // AI_SESSION_PAGE)
+        page = max(0, min(int(page), total - 1))
+        session.session_page = page
+        start = page * AI_SESSION_PAGE
+        current = session.current_session_file or ""
+        real_current = os.path.realpath(current) if current else ""
+        rows = []
+        for idx in range(start, min(start + AI_SESSION_PAGE, len(sessions))):
+            record = sessions[idx]
+            label = self._ai_session_label(record)
+            if real_current and os.path.realpath(record["path"]) == real_current:
+                label = "\u2713 " + label
+            rows.append([{"text": label, "callback_data": f"ais:s:{idx}"}])
+
+        nav = [{"text": "New session", "callback_data": "ais:n"}]
+        if page > 0:
+            nav.append({"text": "\u2039 Prev", "callback_data": f"ais:p:{page - 1}"})
+        nav.append({"text": f"{page + 1}/{total}", "callback_data": "ais:x"})
+        if page < total - 1:
+            nav.append({"text": "Next \u203a", "callback_data": f"ais:p:{page + 1}"})
+        rows.append(nav)
+
+        if sessions:
+            text = (
+                f"Pi sessions for {session.cwd} - page {page + 1}/{total}\n"
+                f"Current: {self._ai_current_session_title(session)}\n"
+                "Tap a session to resume it, or start a new one."
+            )
+        else:
+            text = (
+                f"No saved pi sessions for {session.cwd}.\n"
+                "Send a message or use New session to start one."
+            )
+        markup = json.dumps({"inline_keyboard": rows})
+        if edit_id:
+            self._ai_edit(cid, edit_id, text, markup)
+        else:
+            result = self._record_out(cid, text, reply_markup=markup)
+            session.session_message_id = (result or {}).get("message_id")
+
+    def _ai_callback_new_session(self, session, message_id):
+        cid = session.cid
+        if session.working:
+            self._ai_edit(
+                cid, message_id,
+                "pi is still working - send /stop before starting a new session.")
+            return
+        _data, error = session.command("new_session", timeout=30)
+        if error:
+            self._ai_edit(cid, message_id, f"Could not start a new session: {error}",
+                          json.dumps({"inline_keyboard": []}))
+            return
+        if (_data or {}).get("cancelled"):
+            self._ai_edit(cid, message_id, "The new session was cancelled by an extension.",
+                          json.dumps({"inline_keyboard": []}))
+            return
+        state, _error = session.command("get_state", timeout=15)
+        session.apply_state(state)
+        session.buttons.clear()
+        self._ai_edit(
+            cid, message_id,
+            f"New pi session started.\ncd: {session.cwd}",
+            json.dumps({"inline_keyboard": []}))
+        log(self.cfg, f"ai {cid}: new session from picker")
+
+    def _ai_session_in_use(self, cid, path):
+        """Return the other chat id already using this session file."""
+        real = os.path.realpath(path)
+        with self.ai_lock:
+            sessions = list(self.ai_sessions.items())
+        for other_cid, other in sessions:
+            if other_cid == cid:
+                continue
+            if not other.alive:
+                continue
+            current = getattr(other, "current_session_file", "")
+            if current and os.path.realpath(current) == real:
+                return other_cid
+        return None
+
+    def _ai_callback_resume(self, session, index, message_id):
+        cid = session.cid
+        try:
+            record = session.session_list[index]
+        except (IndexError, TypeError):
+            self._ai_edit(
+                cid, message_id,
+                "That session is no longer in the list - send /session again.")
+            return
+        if session.working:
+            self._ai_edit(
+                cid, message_id,
+                "pi is still working - send /stop before switching sessions.")
+            return
+        path = record["path"]
+        if not os.path.isfile(path):
+            self._ai_edit(cid, message_id, "That session file is gone - send /session again.")
+            return
+        cwd = record.get("cwd") or ""
+        if cwd and not os.path.isdir(cwd):
+            self._ai_edit(
+                cid, message_id,
+                f"That session's cd no longer exists: {cwd}")
+            return
+        other = self._ai_session_in_use(cid, path)
+        if other:
+            self._ai_edit(
+                cid, message_id,
+                f"That session is already open in chat {other}.\n"
+                "Close it there first.")
+            return
+        if session.current_session_file and \
+                os.path.realpath(path) == os.path.realpath(session.current_session_file):
+            self._ai_edit(
+                cid, message_id,
+                f"That is already the current session.\ncd: {session.cwd}")
+            return
+
+        result, error = session.command(
+            "switch_session", timeout=30, sessionPath=path)
+        if error:
+            self._ai_edit(
+                cid, message_id, f"Could not resume that session: {error}",
+                json.dumps({"inline_keyboard": []}))
+            return
+        if (result or {}).get("cancelled"):
+            self._ai_edit(
+                cid, message_id, "The session switch was cancelled by an extension.",
+                json.dumps({"inline_keyboard": []}))
+            return
+
+        state, _error = session.command("get_state", timeout=15)
+        session.apply_state(state)
+        session.buttons.clear()
+        if cwd and os.path.isdir(cwd):
+            session.cwd = cwd
+            write_workdir(self.cfg, cwd)
+        model = session.current_model or {}
+        model_name = model.get("id") or "default"
+        if model.get("provider"):
+            model_name = f"{model.get('provider')}/{model_name}"
+        text = (
+            f"Session resumed: {record.get('title') or 'session'}\n"
+            f"cd: {session.cwd}\n"
+            f"model: {model_name}\n"
+            f"messages: {session.message_count}"
+        )
+        self._ai_edit(cid, message_id, text, json.dumps({"inline_keyboard": []}))
+        log(self.cfg, f"ai {cid}: resumed session {record.get('id') or path}")
+
+    def _chat_ai_status_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        stats, error = session.command("get_session_stats", timeout=20)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+            return
+        state, _error = session.command("get_state", timeout=15)
+        session.apply_state(state)
+        stats = stats or {}
+        tokens = stats.get("tokens") or {}
+        context = stats.get("contextUsage") or {}
+
+        def number(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        model = session.current_model or {}
+        model_name = model.get("id") or "default"
+        if model.get("provider"):
+            model_name = f"{model.get('provider')}/{model_name}"
+        context_tokens = number(context.get("tokens"))
+        context_window = number(context.get("contextWindow"))
+        percent = context.get("percent")
+        if percent is None and context_window:
+            percent = context_tokens * 100.0 / context_window
+        if isinstance(percent, (int, float)):
+            percent_text = f"{percent:.1f}%"
+        else:
+            percent_text = "?"
+        session_label = session.current_session_id[:8] or "new"
+        if session.current_session_name:
+            session_label += f" ({session.current_session_name})"
+        lines = [
+            "AI status",
+            f"cd: {session.cwd}",
+            f"model: {model_name}",
+            f"thinking: {session.current_thinking or 'default'}",
+            f"session: {session_label}",
+            f"messages: {number(stats.get('userMessages'))} user, "
+            f"{number(stats.get('assistantMessages'))} assistant, "
+            f"{number(stats.get('toolCalls'))} tool calls",
+            f"tokens out: {number(tokens.get('output')):,}  |  "
+            f"total: {number(tokens.get('total')):,}",
+            f"tokens in: {number(tokens.get('input')):,}  |  "
+            f"cache read: {number(tokens.get('cacheRead')):,}  |  "
+            f"cache write: {number(tokens.get('cacheWrite')):,}",
+            f"context: {context_tokens:,} / {context_window:,} ({percent_text})",
+            f"cost: ${float(stats.get('cost') or 0):.4f}",
+        ]
+        session_file = stats.get("sessionFile") or session.current_session_file
+        if session_file:
+            lines.append(f"file: {session_file}")
+        text = "\n".join(lines)
+        self._record_out(
+            cid, telegram_code_block(text), parse_mode="HTML", history_text=text)
+
+    def _chat_ai_agent_reply(self, cid):
+        default_path = tgmessage_prompt_path()
+        try:
+            with open(default_path, encoding="utf-8") as fh:
+                default_text = fh.read().strip()
+        except OSError:
+            default_text = f"(missing default rules file: {default_path})"
+        rules = load_ai_rules(self.cfg, cid)
+        lines = [
+            "AI agent rules",
+            "",
+            f"Default rules: {default_path}",
+            default_text,
+            "",
+            f"Custom rules for this chat: {len(rules)}",
+        ]
+        if rules:
+            for index, rule in enumerate(rules, 1):
+                lines.append(f"{index}. {rule}")
+        else:
+            lines.append("(none)")
+        lines += [
+            "",
+            "Add with /ai-agent-add <rule-text>",
+            "Remove with /ai-agent-remove <number|text>",
+            "Rules are injected into every new pi session for this chat.",
+        ]
+        for chunk in split_message("\n".join(lines), 3500):
+            self._record_out(cid, chunk)
+
+    def _ai_agent_rule_update(self, cid, note):
+        session = self._ai_session(cid)
+        if session is None or not session.alive:
+            return
+        rules = load_ai_rules(self.cfg, cid)
+        text = note + "\n\nCurrent custom rules:\n"
+        if rules:
+            text += "\n".join(f"{i}. {rule}" for i, rule in enumerate(rules, 1))
+        else:
+            text += "(none)"
+        self._ai_prompt_async(cid, text)
+
+    def _chat_ai_agent_add_reply(self, cid, rule):
+        rule = " ".join(str(rule or "").split())
+        if not rule:
+            self._record_out(cid, "usage: /ai-agent-add <rule-text>")
+            return
+        if len(rule) > 2000:
+            self._record_out(cid, "that rule is too long (max 2000 characters).")
+            return
+        rules = load_ai_rules(self.cfg, cid)
+        if len(rules) >= 50:
+            self._record_out(cid, "this chat already has 50 custom rules - remove one first.")
+            return
+        if rule in rules:
+            self._record_out(cid, "that rule is already in the list.")
+            return
+        rules.append(rule)
+        if not save_ai_rules(self.cfg, cid, rules):
+            self._record_out(cid, "could not save the rule - check the state directory.")
+            return
+        self._record_out(
+            cid,
+            f"AI agent rule #{len(rules)} added:\n{rule}\n\n"
+            "It applies to this session now and is injected into new sessions.",
+        )
+        self._ai_agent_rule_update(
+            cid, f"The operator added persistent AI agent rule #{len(rules)}:\n{rule}")
+        log(self.cfg, f"ai {cid}: agent rule added")
+
+    def _chat_ai_agent_remove_reply(self, cid, rule):
+        rule = " ".join(str(rule or "").split())
+        if not rule:
+            self._record_out(cid, "usage: /ai-agent-remove <number|rule-text>")
+            return
+        rules = load_ai_rules(self.cfg, cid)
+        if not rules:
+            self._record_out(cid, "this chat has no custom AI agent rules.")
+            return
+        removed = []
+        if rule.isdigit():
+            index = int(rule) - 1
+            if index < 0 or index >= len(rules):
+                self._record_out(cid, f"no rule number {rule} - use /ai-agent to list them.")
+                return
+            removed = [rules.pop(index)]
+        else:
+            exact = [item for item in rules if item.lower() == rule.lower()]
+            if exact:
+                removed = exact
+                rules = [item for item in rules if item not in exact]
+            else:
+                removed = [item for item in rules if rule.lower() in item.lower()]
+                rules = [item for item in rules if item not in removed]
+        if not removed:
+            self._record_out(cid, "no matching rule found - use /ai-agent to list them.")
+            return
+        if not save_ai_rules(self.cfg, cid, rules):
+            self._record_out(cid, "could not save the rules - check the state directory.")
+            return
+        listing = "\n".join(f"- {item}" for item in removed)
+        self._record_out(
+            cid,
+            f"Removed {len(removed)} AI agent rule(s):\n{listing}\n\n"
+            "The change applies now and to new sessions.",
+        )
+        self._ai_agent_rule_update(
+            cid, "The operator removed these persistent AI agent rules:\n" + listing)
+        log(self.cfg, f"ai {cid}: {len(removed)} agent rule(s) removed")
+
+    def _chat_ai_model_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        data, error = session.command("get_available_models", timeout=30)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+            return
+        models = (data or {}).get("models") or []
+        if not models:
+            self._record_out(cid, "pi reported no available models.")
+            return
+        state, _error = session.command("get_state", timeout=15)
+        if state:
+            session.apply_state(state)
+        current_provider = (session.current_model or {}).get("provider")
+        session.models = sorted(
+            models,
+            key=lambda m: (
+                0 if m.get("provider") == current_provider else 1,
+                str(m.get("provider") or ""),
+                str(m.get("name") or m.get("id") or ""),
+            ),
+        )
+        session.model_page = 0
+        self._ai_send_model_page(session, 0)
+
+    def _ai_model_label(self, model):
+        name = str(model.get("name") or model.get("id") or "model")
+        provider = str(model.get("provider") or "")
+        label = f"{name} [{provider}]" if provider else name
+        return label[:58]
+
+    def _ai_send_model_page(self, session, page, edit_id=None):
+        cid = session.cid
+        models = session.models
+        total = max(1, (len(models) + AI_MODEL_PAGE - 1) // AI_MODEL_PAGE)
+        page = max(0, min(int(page), total - 1))
+        session.model_page = page
+        start = page * AI_MODEL_PAGE
+        current = session.current_model or {}
+        current_key = (current.get("provider"), current.get("id"))
+        rows = []
+        for idx in range(start, min(start + AI_MODEL_PAGE, len(models))):
+            model = models[idx]
+            key = (model.get("provider"), model.get("id"))
+            label = ("\u2713 " if key == current_key else "") + self._ai_model_label(model)
+            rows.append([{"text": label, "callback_data": f"aim:s:{idx}"}])
+        nav = []
+        if page > 0:
+            nav.append({"text": "\u2039 Prev", "callback_data": f"aim:p:{page - 1}"})
+        nav.append({"text": f"{page + 1}/{total}", "callback_data": "aim:x"})
+        if page < total - 1:
+            nav.append({"text": "Next \u203a", "callback_data": f"aim:p:{page + 1}"})
+        rows.append(nav)
+        if current.get("id"):
+            current_text = f"{current.get('provider')}/{current.get('id')}"
+        else:
+            current_text = "default"
+        text = (
+            f"Model picker - page {page + 1}/{total}\n"
+            f"Current: {current_text}\n"
+            "Tap a model to switch."
+        )
+        markup = json.dumps({"inline_keyboard": rows})
+        if edit_id:
+            self._ai_edit(cid, edit_id, text, markup)
+        else:
+            result = self._record_out(cid, text, reply_markup=markup)
+            session.model_message_id = (result or {}).get("message_id")
+
+    def _ai_edit(self, cid, message_id, text, markup=None):
+        if not message_id:
+            self._record_out(cid, text)
+            return
+        try:
+            self.tg.edit_message_text(
+                cid, message_id, text, reply_markup=markup)
+        except TelegramError as exc:
+            if "not modified" in str(exc).lower():
+                return
+            log(self.cfg, f"editMessageText {cid} failed: {exc}")
+            self._record_out(cid, text)
+
+    def _chat_ai_thinking_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        data, error = session.command("get_available_thinking_levels", timeout=20)
+        if error:
+            self._record_out(cid, f"AI error: {error}")
+            return
+        levels = (data or {}).get("levels") or []
+        if not levels:
+            self._record_out(cid, "this model has no thinking levels.")
+            return
+        state, _error = session.command("get_state", timeout=15)
+        if state:
+            session.apply_state(state)
+        session.think_levels = [str(level) for level in levels]
+        rows = []
+        row = []
+        for idx, level in enumerate(session.think_levels):
+            label = ("\u2713 " if level == session.current_thinking else "") + level
+            row.append({"text": label, "callback_data": f"aith:s:{idx}"})
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        text = (
+            "Thinking level\n"
+            f"Current: {session.current_thinking or 'default'}\n"
+            "Tap a level to switch."
+        )
+        self._record_out(
+            cid, text, reply_markup=json.dumps({"inline_keyboard": rows}))
+
+    def handle_callback_query(self, callback):
+        cb_id = callback.get("id")
+        if cb_id:
+            try:
+                self.tg.answer_callback_query(cb_id)
+            except TelegramError as exc:
+                log(self.cfg, f"answerCallbackQuery failed: {exc}")
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        cid = str(chat.get("id") or (callback.get("from") or {}).get("id") or "")
+        data = str(callback.get("data") or "")
+        if not cid or not data.startswith("ai"):
+            return
+        if cid not in self.allowed or not self.can_sys(cid):
+            return
+        threading.Thread(
+            target=self._handle_ai_callback,
+            args=(cid, data, message.get("message_id")),
+            daemon=True,
+        ).start()
+
+    def _ai_control_button(self, session, key, message_id):
+        cid = session.cid
+        item = session.buttons.pop(key, None)
+        if item is None:
+            self._record_out(
+                cid, "That button has expired. Ask the AI to send a new one.")
+            return
+        label = str(item.get("label") or "")
+        value = str(item.get("value") or label)
+        text = str(item.get("text") or "Selection")
+        shown = f"{text}\n\nSelected: {label}" if label else text
+        if message_id:
+            self._ai_edit(
+                cid, message_id, shown[:4000],
+                json.dumps({"inline_keyboard": []}))
+        else:
+            self._record_out(cid, shown[:4000])
+        if value.strip():
+            self._ai_prompt_async(cid, value)
+        else:
+            self._record_out(cid, "that button had no value.")
+
+    def _handle_ai_callback(self, cid, data, message_id):
+        session = self._ai_session(cid)
+        if session is None or not session.alive:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        if data.startswith("aitg:"):
+            self._ai_control_button(session, data.split(":", 1)[1], message_id)
+            return
+        if data == "aim:x":
+            return
+        if data == "ais:x":
+            return
+        if data.startswith("ais:p:"):
+            try:
+                page = int(data.split(":", 2)[2])
+            except (IndexError, ValueError):
+                return
+            self._ai_send_session_page(session, page, edit_id=message_id)
+            return
+        if data == "ais:n":
+            self._ai_callback_new_session(session, message_id)
+            return
+        if data.startswith("ais:s:"):
+            try:
+                idx = int(data.split(":", 2)[2])
+            except (IndexError, ValueError):
+                return
+            self._ai_callback_resume(session, idx, message_id)
+            return
+        if data.startswith("aim:p:"):
+            try:
+                page = int(data.split(":", 2)[2])
+            except (IndexError, ValueError):
+                return
+            self._ai_send_model_page(session, page, edit_id=message_id)
+            return
+        if data.startswith("aim:s:"):
+            try:
+                idx = int(data.split(":", 2)[2])
+                model = session.models[idx]
+            except (IndexError, ValueError):
+                self._record_out(cid, "that model is no longer in the list - send /model again.")
+                return
+            provider = str(model.get("provider") or "")
+            model_id = str(model.get("id") or "")
+            chosen, error = session.command(
+                "set_model", timeout=30, provider=provider, modelId=model_id)
+            if error:
+                self._ai_edit(
+                    cid, message_id, f"Could not switch model: {error}",
+                    json.dumps({"inline_keyboard": []}))
+                return
+            session.current_model = chosen or model
+            self._ai_edit(
+                cid, message_id, f"Model set: {provider}/{model_id}",
+                json.dumps({"inline_keyboard": []}))
+            log(self.cfg, f"ai {cid}: model set to {provider}/{model_id}")
+            return
+        if data.startswith("aith:s:"):
+            try:
+                idx = int(data.split(":", 2)[2])
+                level = session.think_levels[idx]
+            except (IndexError, ValueError):
+                self._record_out(cid, "that thinking level is gone - send /thinking again.")
+                return
+            _data, error = session.command(
+                "set_thinking_level", timeout=30, level=level)
+            if error:
+                self._ai_edit(
+                    cid, message_id, f"Could not set thinking: {error}",
+                    json.dumps({"inline_keyboard": []}))
+                return
+            session.current_thinking = level
+            self._ai_edit(
+                cid, message_id, f"Thinking set: {level}",
+                json.dumps({"inline_keyboard": []}))
+            log(self.cfg, f"ai {cid}: thinking set to {level}")
+
     # ---- /sh-on: sys-only root shell in a private chat ----------------
     @staticmethod
     def _shell_private(cid, chat_type):
@@ -2736,8 +4633,10 @@ class Daemon:
         return chat_type == "private" and looks_like_id(cid) and int(cid) > 0
 
     def _shell_home(self):
-        home = os.path.expanduser("~")
-        return home if os.path.isdir(home) else self.cfg.home
+        fallback = os.path.expanduser("~")
+        if not os.path.isdir(fallback):
+            fallback = self.cfg.home
+        return read_workdir(self.cfg) or fallback
 
     @property
     def _shell_state_path(self):
@@ -2850,6 +4749,17 @@ class Daemon:
         for proc in procs:
             kill_process_group(proc)
 
+    def _stop_ai_sessions(self):
+        """Stop every pi process when the daemon shuts down."""
+        with self.ai_lock:
+            sessions = list(self.ai_sessions.values())
+            self.ai_sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as exc:  # noqa: BLE001
+                log(self.cfg, f"closing ai session {session.cid} failed: {exc!r}")
+
     def _shell_left(self, sess):
         now = time.time()
         return max(0, min(
@@ -2881,8 +4791,18 @@ class Daemon:
             threading.Thread(target=self._chat_shell_on_reply, args=(cid, chat_type), daemon=True).start()
             return True
         if head in ("/help", "/start", "/commands",
-                    "/status", "/logs", "/cancel_upload", "/recover"):
+                    "/status", "/logs", "/cancel_upload", "/recover",
+                    "/ai-status", "/ai_status", "/ai-agent", "/ai_agent",
+                    "/ai-agent-add", "/ai_agent_add",
+                    "/ai-agent-remove", "/ai_agent_remove"):
             return False
+        if head in ("/ai", "/ai-exit", "/ai_exit"):
+            threading.Thread(
+                target=self._record_out,
+                args=(cid, "root shell is ON - send /sh-off before using AI mode."),
+                daemon=True,
+            ).start()
+            return True
         # Other slash text is a shell command too, so /bin/ls keeps working.
         self._maybe_shell_input(cid, cmd, chat_type, edited)
         return True
@@ -3110,6 +5030,9 @@ class Daemon:
                 if keep and new_cwd:
                     sess["cwd"] = new_cwd
                 expired = bool(keep and time.time() - sess["started"] >= self.cfg.shell_max)
+            if new_cwd and os.path.isdir(new_cwd):
+                # Keep the cd even after /sh-off, so /ai starts there too.
+                write_workdir(self.cfg, new_cwd)
             if keep:
                 shown = command if len(command) <= 500 else command[:500] + "…"
                 text = f"$ {shown}\n{result['text']}\n\n[{status} · {elapsed:.1f}s]"
@@ -3485,6 +5408,7 @@ class Daemon:
             self.serve()
         finally:
             self._stop_shell_commands()
+            self._stop_ai_sessions()
             self._clear_pid()
 
     def _register_commands(self):
@@ -5157,10 +7081,18 @@ battery, IPs);
 partial file;
 /sh_on opens a root shell in a private chat (disabled by default; enable with
 `tgmessage shell on`), then every plain message runs as a root command;
-/sh_off closes it (/sh-on and /sh-off are accepted too); /help lists these
-commands; every photo/file you send is saved into files/ (see TG_FILES_DIR).
-The Telegram '/' menu is registered automatically; sync it with
-`tgmessage commands`.
+/sh_off closes it (/sh-on and /sh-off are accepted too); /ai starts AI mode in
+the saved cd and /ai-exit stops it.  While /sh_on is active, /ai is refused.
+Inside AI mode /model and /thinking show Telegram buttons, /session resumes
+a saved pi session for the current cd, /ai-status shows token and context
+usage, /ai-agent lists the injected rules, and /ai-agent-add,
+/ai-agent-remove manage custom rules.  /pi sends text or a pi command
+explicitly, and thinking text plus tool calls stay hidden.  tgmessage.md is
+injected into every new AI session so the AI can send code blocks, HTML,
+buttons, typing actions and short progress status messages.
+/help lists these commands; every photo/file you send is saved into files/
+(see TG_FILES_DIR).  The Telegram '/' menu is registered automatically; sync
+it with `tgmessage commands`.
 """
 
 
@@ -5586,6 +7518,7 @@ def cmd_status(cfg, colours, rest):
     print(f"  services      {', '.join(cfg.watch_services) or '(none - tgmessage service add)'}")
     print(f"  default chat  {cfg.default_chat or '(none)'}")
     print(f"  listening     {cfg.host}:{cfg.port}")
+    print(f"  working dir   {read_workdir(cfg)}")
     print(f"  bot api       {cfg.api_root or 'Telegram cloud'}  (files up to {human_size(cfg.max_download)})")
     if cfg.is_local_api:
         print(f"  local api     {local_api_service_state()}")
