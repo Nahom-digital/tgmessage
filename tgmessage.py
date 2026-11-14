@@ -1403,9 +1403,319 @@ def _session_message_text(content):
     return ""
 
 
+def format_duration(seconds):
+    """Small human duration: 42s, 3m 10s, 1h 4m."""
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        total = 0
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s" if sec else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+
+
+def pi_session_context(path, max_chars=12000, max_messages=24):
+    """Recent conversation text for a /btw side question."""
+    if not path or not os.path.isfile(path):
+        return ""
+    messages = []
+    summary = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                kind = record.get("type")
+                if kind == "compaction":
+                    text = str(record.get("summary") or "").strip()
+                    if text:
+                        summary = text
+                    continue
+                if kind != "message":
+                    continue
+                message = record.get("message") or {}
+                role = message.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = _session_message_text(message.get("content")).strip()
+                if role == "assistant":
+                    text = re.sub(
+                        r"<tg>\s*.*?\s*</tg>", "", text,
+                        flags=re.IGNORECASE | re.DOTALL).strip()
+                if not text:
+                    continue
+                if len(text) > 4000:
+                    text = text[:4000].rstrip() + "..."
+                messages.append((role, text))
+                if len(messages) > max_messages:
+                    messages = messages[-max_messages:]
+    except OSError:
+        return ""
+
+    chunks = []
+    if summary:
+        if len(summary) > 6000:
+            summary = summary[:6000].rstrip() + "..."
+        chunks.append("Summary of earlier conversation:\n" + summary)
+    for role, text in messages:
+        chunks.append(f"{'User' if role == 'user' else 'Assistant'}: {text}")
+    context = "\n\n".join(chunks).strip()
+    if len(context) > max_chars:
+        context = "...(older context trimmed)\n\n" + context[-max_chars:]
+    return context
+
+
+PI_BTW_PACKAGE = "@narumitw/pi-btw"
+
+
+def pi_btw_installed():
+    """Check the normal pi package roots for @narumitw/pi-btw."""
+    home = os.path.expanduser("~")
+    agent_dir = (os.environ.get("PI_CODING_AGENT_DIR") or "").strip()
+    if not agent_dir:
+        agent_dir = os.path.join(home, ".pi", "agent")
+    agent_dir = os.path.expanduser(agent_dir)
+    roots = [
+        os.path.join(agent_dir, "npm", "node_modules"),
+        os.path.join(home, ".pi", "agent", "npm", "node_modules"),
+        "/root/.pi/agent/npm/node_modules",
+    ]
+    for root in roots:
+        if os.path.isdir(os.path.join(root, "@narumitw", "pi-btw")):
+            return True
+    settings_path = os.path.join(agent_dir, "settings.json")
+    try:
+        with open(settings_path, encoding="utf-8") as fh:
+            packages = (json.load(fh) or {}).get("packages") or []
+    except (OSError, ValueError, json.JSONDecodeError):
+        packages = []
+    return any(PI_BTW_PACKAGE in str(item) for item in packages)
+
+
+def btw_missing_text():
+    return "\n".join([
+        "/btw is unavailable: @narumitw/pi-btw is not installed.",
+        "",
+        "Install it on the server:",
+        "  pi install npm:@narumitw/pi-btw",
+        "",
+        "Then send /btw again.",
+    ])
+
+
+def btw_system_prompt_path():
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "btw-system-prompt.md")
+
+
+def build_btw_prompt(question, context):
+    return "\n".join([
+        "Answer this side question without modifying the main conversation.",
+        "",
+        "<side_question>",
+        question.strip(),
+        "</side_question>",
+        "",
+        "<conversation_context>",
+        context.strip() or "No prior conversation context was available.",
+        "</conversation_context>",
+    ])
+
+
+def run_pi_side_question(pi, cwd, provider, model, thinking, question, context,
+                         timeout=180):
+    """Run a throwaway pi side question without touching the main session.
+
+    pi-btw only opens its side UI in TUI mode, so this uses the same
+    side-question system prompt and context in a separate print-mode process.
+    """
+    system_path = btw_system_prompt_path()
+    if not os.path.isfile(system_path):
+        return "", f"missing {system_path}"
+    args = [
+        pi, "-p", "--no-session", "-nt", "-ne", "-ns", "-np", "-nc",
+        "--system-prompt", system_path,
+    ]
+    if provider and model:
+        args += ["--provider", provider]
+    if model:
+        args += ["--model", model]
+    if thinking:
+        args += ["--thinking", thinking]
+    args += ["--", build_btw_prompt(question, context)]
+
+    env = os.environ.copy()
+    pi_dir = os.path.dirname(pi)
+    path = env.get("PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if pi_dir and pi_dir not in path.split(os.pathsep):
+        path = pi_dir + os.pathsep + path
+    env["PATH"] = path
+    env.setdefault("HOME", os.path.expanduser("~"))
+    env["TERM"] = "dumb"
+    env["NO_COLOR"] = "1"
+    try:
+        proc = subprocess.Popen(
+            args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True, close_fds=True,
+        )
+    except OSError as exc:
+        return "", f"could not start pi: {exc}"
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc)
+        try:
+            proc.communicate(timeout=3)
+        except Exception:  # noqa: BLE001
+            pass
+        return "", f"side question timed out after {int(timeout)}s"
+    answer = (out or "").strip()
+    if proc.returncode != 0:
+        detail = (err or out or "").strip()
+        if len(detail) > 800:
+            detail = detail[-800:]
+        return "", f"pi exited with {proc.returncode}: {detail or 'no details'}"
+    if not answer:
+        detail = (err or "").strip()
+        if len(detail) > 400:
+            detail = detail[-400:]
+        return "", "pi returned no answer" + (f": {detail}" if detail else "")
+    return answer, None
+
+
+AI_LIVE_DIR = "live"
+AI_LIVE_STALE = 15
+
+
+def live_state_dir(cfg):
+    return os.path.join(cfg.state_dir, AI_LIVE_DIR)
+
+
+def read_live_states(cfg):
+    """Read fresh heartbeat files written by tg-live.ts."""
+    states = {}
+    directory = live_state_dir(cfg)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return states
+    now = time.time()
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            pid = int(data.get("pid") or 0)
+            updated = float(data.get("updatedAt") or 0)
+        except (TypeError, ValueError):
+            continue
+        if updated > now * 10:
+            updated /= 1000.0
+        if pid <= 0 or now - updated > AI_LIVE_STALE:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        data["pid"] = pid
+        data["updatedAt"] = updated
+        states[pid] = data
+    return states
+
+
+def _process_elapsed(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+        end = raw.rfind(")")
+        if end < 0:
+            return None
+        fields = raw[end + 2:].split()
+        if not fields or fields[0] == "Z":
+            return None
+        start_ticks = int(fields[19])
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            uptime = float(fh.read().split()[0])
+        hz = float(os.sysconf("SC_CLK_TCK"))
+        return max(0.0, uptime - start_ticks / hz)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def find_live_pi_processes(cwd):
+    """Find pi processes whose working directory is exactly cwd."""
+    target = os.path.realpath(cwd)
+    found = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return found
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+        if not argv:
+            continue
+        base = os.path.basename(argv[0])
+        if base not in ("pi", "pi.js") and not base.startswith("pi-"):
+            if not any(os.path.basename(arg) in ("pi", "pi.js") for arg in argv[:2]):
+                continue
+        if "--no-session" in argv or "-p" in argv or "--print" in argv:
+            continue
+        try:
+            proc_cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            continue
+        if proc_cwd != target:
+            continue
+        elapsed = _process_elapsed(pid)
+        if elapsed is None:
+            continue
+        found.append({"pid": pid, "elapsed": elapsed, "argv": argv})
+    found.sort(key=lambda item: item["elapsed"], reverse=True)
+    return found
+
+
+
 def _one_line(text, limit):
     text = " ".join(str(text or "").split())
     return text[:limit]
+
+
+def _short_session_id(path):
+    base = os.path.basename(str(path or ""))
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    if "_" in base:
+        base = base.rsplit("_", 1)[-1]
+    return ("session " + base[:8]) if base else "new session"
 
 
 def _parse_session_blob(blob, meta):
@@ -1709,7 +2019,15 @@ class AiSession:
             self.rules_paths.append(custom_rules)
             args += ["--append-system-prompt", custom_rules]
 
+        live_extension = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tg-live.ts")
+        if os.path.isfile(live_extension):
+            args += ["--extension", live_extension]
+        else:
+            log(self.cfg, f"ai: missing {live_extension} - /live subagent data off")
+
         env = os.environ.copy()
+        env["TG_LIVE_STATE_DIR"] = live_state_dir(self.cfg)
         pi_dir = os.path.dirname(self.pi)
         path = env.get("PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         if pi_dir and pi_dir not in path.split(os.pathsep):
@@ -2972,6 +3290,8 @@ def chat_help_text(cfg, is_sys=False, is_mang=False):
                 "/ai-agent  - show the rules injected into the AI",
                 "/ai-agent-add <text> - add a persistent AI rule",
                 "/ai-agent-remove <n|text> - remove an AI rule",
+                "/btw <text> - quick side question in AI mode",
+                "/live - running pi sessions and subagents in the saved cd",
             ]
         else:
             lines += [
@@ -3043,6 +3363,8 @@ BOT_COMMANDS = [
     ("ai_agent", "Show the AI agent rules"),
     ("ai_agent_add", "Add an AI agent rule"),
     ("ai_agent_remove", "Remove an AI agent rule"),
+    ("btw", "Ask a quick side question (AI mode)"),
+    ("live", "Show live pi sessions and subagents"),
 ]
 
 
@@ -3525,6 +3847,16 @@ class Daemon:
             self._record_out(cid, "The session picker only works in AI mode. Send /ai first.")
         elif head in ("/ai-status", "/ai_status"):
             self._record_out(cid, "AI mode is OFF - send /ai first.")
+        elif head == "/btw":
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/btw", "sys"), daemon=True).start()
+            else:
+                self._record_out(cid, "AI mode is OFF - send /ai first, then /btw <question>.")
+        elif head == "/live":
+            if not self.can_sys(cid):
+                threading.Thread(target=self._chat_denied_reply, args=(cid, "/live", "sys"), daemon=True).start()
+            else:
+                threading.Thread(target=self._chat_ai_live_reply, args=(cid,), daemon=True).start()
         elif head in ("/ai-agent", "/ai_agent"):
             if not self.can_sys(cid):
                 threading.Thread(target=self._chat_denied_reply, args=(cid, "/ai-agent", "sys"), daemon=True).start()
@@ -3777,6 +4109,19 @@ class Daemon:
         if head == "/compact":
             threading.Thread(target=self._chat_ai_compact_reply, args=(cid,), daemon=True).start()
             return True
+        if head == "/btw":
+            text = cmd[4:].strip()
+            if not text:
+                self._record_out(cid, "usage: /btw <side question>")
+            else:
+                threading.Thread(
+                    target=self._chat_ai_btw_reply,
+                    args=(cid, text), daemon=True).start()
+            return True
+        if head == "/live":
+            threading.Thread(
+                target=self._chat_ai_live_reply, args=(cid,), daemon=True).start()
+            return True
         if head == "/pi":
             text = cmd[3:].strip()
             if not text:
@@ -3790,6 +4135,7 @@ class Daemon:
                            "/ai-status", "/ai_status", "/ai-agent", "/ai_agent",
                            "/ai-agent-add", "/ai_agent_add",
                            "/ai-agent-remove", "/ai_agent_remove",
+                           "/btw", "/live",
                            "/stop", "/abort", "/compact",
                            "/help", "/start", "/commands"):
                     self._ai_mode_take(cid, text, sub, chat_type, edited)
@@ -3901,6 +4247,8 @@ class Daemon:
             "/thinking - pick the reasoning level with buttons",
             "/session - resume a saved pi session",
             "/ai-status - token and context usage | /ai-agent - injected rules",
+            "/btw <text> - quick side question without touching this session",
+            "/live - running pi sessions and subagents in this path",
             "/new - start a fresh pi session | /stop - abort | /compact - compact context",
             "/pi <text> - send text or a pi command explicitly",
             "/status, /logs, /recover still run the server commands",
@@ -3931,6 +4279,8 @@ class Daemon:
             "  /ai-agent    show the injected AI rules\n"
             "  /ai-agent-add <text> - add a persistent rule\n"
             "  /ai-agent-remove <n|text> - remove a rule\n"
+            "  /btw <text> - quick side question, main session untouched\n"
+            "  /live       show running pi sessions and subagents\n"
             "  /new         start a fresh pi session\n"
             "  /stop        abort the current run\n"
             "  /compact     compact the conversation context\n"
@@ -4213,6 +4563,138 @@ class Daemon:
         )
         self._ai_edit(cid, message_id, text, json.dumps({"inline_keyboard": []}))
         log(self.cfg, f"ai {cid}: resumed session {record.get('id') or path}")
+
+    def _chat_ai_btw_reply(self, cid, question):
+        session = self._ai_session(cid)
+        if session is None:
+            self._record_out(cid, "AI mode is OFF - send /ai to start it.")
+            return
+        question = (question or "").strip()
+        if not question:
+            self._record_out(cid, "usage: /btw <side question>")
+            return
+        if not pi_btw_installed():
+            self._record_out(cid, btw_missing_text())
+            return
+
+        if not session.current_session_file:
+            state, _error = session.command("get_state", timeout=15)
+            session.apply_state(state)
+        context = pi_session_context(session.current_session_file)
+        model = session.current_model or {}
+        provider = str(model.get("provider") or "")
+        model_id = str(model.get("id") or "")
+        self._record_out(cid, "btw: thinking....")
+        answer, error = run_pi_side_question(
+            session.pi, session.cwd, provider, model_id,
+            session.current_thinking or "", question, context,
+        )
+        if error:
+            self._record_out(cid, f"btw error: {error}")
+            return
+        for chunk in split_message(f"btw:\n{answer}", 3800):
+            self._record_out(cid, chunk)
+        log(self.cfg, f"ai {cid}: /btw {question[:160]!r}")
+
+    def _chat_ai_live_reply(self, cid):
+        session = self._ai_session(cid)
+        if session is not None:
+            cwd = session.cwd
+        else:
+            cwd = read_workdir(self.cfg)
+            if not os.path.isdir(cwd):
+                cwd = default_workdir(self.cfg)
+
+        states = read_live_states(self.cfg)
+        processes = find_live_pi_processes(cwd)
+        current_pid = None
+        if session is not None and session.proc is not None and session.proc.poll() is None:
+            current_pid = session.proc.pid
+            if not any(item["pid"] == current_pid for item in processes):
+                processes.append({
+                    "pid": current_pid,
+                    "elapsed": max(0.0, time.time() - session.started),
+                    "argv": [],
+                })
+        processes.sort(key=lambda item: (
+            0 if current_pid is not None and item["pid"] == current_pid else 1,
+            -item["elapsed"],
+        ))
+        if not processes:
+            self._record_out(cid, f"No live pi sessions in {cwd}.")
+            return
+
+        lines = [f"Live pi sessions in {cwd}", ""]
+        for item in processes[:8]:
+            pid = item["pid"]
+            state = states.get(pid) or {}
+            is_current = current_pid is not None and pid == current_pid
+            label = "AI session" if is_current else "pi session"
+            lines.append(
+                f"\u25cf {label} - {format_duration(item['elapsed'])} (pid {pid})")
+
+            meta = []
+            if is_current:
+                model = session.current_model or {}
+                if model.get("provider"):
+                    meta.append(f"{model.get('provider')}/{model.get('id') or 'default'}")
+                elif model.get("id"):
+                    meta.append(str(model["id"]))
+                name = session.current_session_name
+                path = session.current_session_file
+            else:
+                if state.get("model"):
+                    meta.append(str(state["model"]))
+                name = str(state.get("sessionName") or "")
+                path = str(state.get("sessionFile") or "")
+            if name:
+                meta.append(name)
+            elif path:
+                meta.append(_short_session_id(path))
+            if meta:
+                lines.append("  " + " | ".join(meta))
+
+            agents = state.get("agents") or []
+            if not isinstance(agents, list):
+                agents = []
+            agents = [agent for agent in agents if isinstance(agent, dict)]
+            agents.sort(key=lambda agent: (
+                0 if str(agent.get("status")) in ("running", "queued") else 1,
+                float(agent.get("startedAt") or 0),
+            ))
+            if agents:
+                lines.append("  subagents:")
+                for agent in agents[:10]:
+                    status = str(agent.get("status") or "queued")
+                    agent_type = _one_line(agent.get("type") or "agent", 24)
+                    started = float(agent.get("startedAt") or 0) / 1000.0
+                    completed = float(agent.get("completedAt") or 0) / 1000.0
+                    duration = float(agent.get("durationMs") or 0) / 1000.0
+                    if status in ("running", "queued"):
+                        elapsed = max(0.0, time.time() - started) if started else 0.0
+                        mark = "\u25cf" if status == "running" else "\u25cb"
+                        detail = f"    {mark} {agent_type} - {status} {format_duration(elapsed)}"
+                    else:
+                        if not duration and started and completed:
+                            duration = max(0.0, completed - started)
+                        if status in ("completed", "steered"):
+                            detail = f"    \u2713 {agent_type} - done in {format_duration(duration)}"
+                        else:
+                            detail = (
+                                f"    \u2717 {agent_type} - {status} "
+                                f"in {format_duration(duration)}")
+                    description = _one_line(agent.get("description") or "", 70)
+                    if description:
+                        detail += f" - {description}"
+                    lines.append(detail)
+                if len(agents) > 10:
+                    lines.append(f"    ... and {len(agents) - 10} more")
+            lines.append("")
+        if len(processes) > 8:
+            lines.append(f"... and {len(processes) - 8} more live sessions")
+
+        for chunk in split_message("\n".join(lines).rstrip(), 3800):
+            self._record_out(cid, chunk)
 
     def _chat_ai_status_reply(self, cid):
         session = self._ai_session(cid)
@@ -4794,7 +5276,8 @@ class Daemon:
                     "/status", "/logs", "/cancel_upload", "/recover",
                     "/ai-status", "/ai_status", "/ai-agent", "/ai_agent",
                     "/ai-agent-add", "/ai_agent_add",
-                    "/ai-agent-remove", "/ai_agent_remove"):
+                    "/ai-agent-remove", "/ai_agent_remove",
+                    "/btw", "/live"):
             return False
         if head in ("/ai", "/ai-exit", "/ai_exit"):
             threading.Thread(
@@ -7086,7 +7569,9 @@ the saved cd and /ai-exit stops it.  While /sh_on is active, /ai is refused.
 Inside AI mode /model and /thinking show Telegram buttons, /session resumes
 a saved pi session for the current cd, /ai-status shows token and context
 usage, /ai-agent lists the injected rules, and /ai-agent-add,
-/ai-agent-remove manage custom rules.  /pi sends text or a pi command
+/ai-agent-remove manage custom rules.  /btw <text> asks a side question
+without adding it to the main session, /live lists running pi sessions and
+subagents in the saved cd.  /pi sends text or a pi command
 explicitly, and thinking text plus tool calls stay hidden.  tgmessage.md is
 injected into every new AI session so the AI can send code blocks, HTML,
 buttons, typing actions and short progress status messages.

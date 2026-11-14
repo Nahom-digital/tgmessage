@@ -76,6 +76,8 @@ with `tgmessage shell on` (see [Root shell](#root-shell-opt-in-dangerous)).
 | `/ai-agent` | show the rules injected into the AI at session start |
 | `/ai-agent-add <text>` | add a persistent rule for this chat |
 | `/ai-agent-remove <n\|text>` | remove a persistent rule by number or text |
+| `/btw <text>` | in AI mode, ask a quick side question without changing the main session |
+| `/live` | show running pi sessions and their subagents in the current cd |
 | `/help` (`/start`) | list the commands |
 | photo / file | saved to `files/`, you get the path back |
 
@@ -157,6 +159,9 @@ starts a fresh pi session, `/stop` aborts a run, `/compact` compacts context
 and `/pi <text>` sends text or a pi slash command explicitly. `/ai-status`
 shows context usage and token counts. `/status`, `/logs`, `/recover` and
 `/cancel_upload` still run the server commands. `/ai-exit` stops AI mode.
+`/btw <text>` asks a quick side question without adding it to the main
+conversation. `/live` shows running pi sessions in the current cd, how long
+they have been running, and the subagents under them.
 
 AI conversations are saved as normal pi sessions, so `/session` also shows
 sessions you created in the pi terminal for the same current directory.
@@ -193,6 +198,27 @@ the change as an immediate rule update message.
 in a private chat with `sys` access. The pi executable is found on `PATH`; set
 `TG_PI_BIN` if it is somewhere else. Optional `TG_AI_MODEL` and `TG_AI_PROVIDER`
 choose the starting model.
+
+### Side questions and live sessions
+
+`/btw <text>` checks that `@narumitw/pi-btw` is installed. If it is missing,
+the bot sends the install command. pi-btw itself only opens its side thread in
+the interactive terminal, so the Telegram bridge runs the same side-question
+prompt and recent conversation context through a throwaway `pi -p` process.
+The main session is not changed. `btw-system-prompt.md` holds that side prompt.
+
+`/live` reads heartbeat data from `tg-live.ts` and scans `/proc` for pi
+processes in the current working directory. It shows only live sessions, how
+long each has been running, and the subagents under the current AI session.
+Running subagents show their elapsed time; finished subagents show their total
+run time. The observer extension is loaded into every AI pi process with
+`--extension`. Without it, `/live` still shows the sessions but no subagent
+details.
+
+Both files must stay next to `tgmessage.py`:
+
+- `btw-system-prompt.md` - side-question system prompt
+- `tg-live.ts` - pi extension that mirrors live subagent records
 
 ## Local Bot API (large files)
 
@@ -386,6 +412,9 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
     .env                 token, permissions, watched services, bot API settings
     tgmessage            shell wrapper (symlinked to /usr/local/bin)
     tgmessage.py         daemon, UI, /status + /logs, allow/service commands
+    tgmessage.md         AI rules injected into every pi session
+    btw-system-prompt.md system prompt for /btw side questions
+    tg-live.ts           pi extension that writes live session/subagent state
     tgmessage.service.in systemd unit template
     install.sh           installer / uninstaller
     files/               files/photos received from Telegram
@@ -402,6 +431,7 @@ Config: `/etc/default/watcher` (`WATCH_INTERVAL`, `NOTIFY`, `TG_HOME`,
         pending.json       chats waiting to be allowed
         chats.json         chat metadata
         offset.json        update offset per Bot API server (cloud/local)
+        live/              live session heartbeats from tg-live.ts
         daemon.log         daemon log (also: journalctl -u tgmessage)
 ```
 
